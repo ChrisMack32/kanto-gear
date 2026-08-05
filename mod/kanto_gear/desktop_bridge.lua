@@ -190,6 +190,7 @@ local state = {
   userClosed = false,
   aspectLock = false,
   nativeAspect = false,
+  sdlHandlingMax = false,
   frameW = FRAME_W,
   frameH = FRAME_H,
   logicalW = 0,
@@ -203,6 +204,9 @@ local state = {
 local SDL_WINDOWPOS_CENTERED = 0x2FFF0000
 local SDL_WINDOW_RESIZABLE = 0x00000020
 local SDL_WINDOW_ALLOW_HIGHDPI = 0x00002000
+local SDL_WINDOW_FULLSCREEN = 0x00000001
+local SDL_WINDOW_FULLSCREEN_DESKTOP = 0x00001000
+local SDL_WINDOW_MAXIMIZED = 0x00000080
 local SDL_RENDERER_SOFTWARE = 0x00000001
 local SDL_RENDERER_ACCELERATED = 0x00000002
 local SDL_RENDERER_PRESENTVSYNC = 0x00000004
@@ -427,7 +431,12 @@ local function defineSDL(ffi)
     void SDL_GetWindowPosition(SDL_Window *window, int *x, int *y);
     uint32_t SDL_GetWindowFlags(SDL_Window *window);
     void SDL_SetWindowSize(SDL_Window *window, int w, int h);
+    void SDL_SetWindowPosition(SDL_Window *window, int x, int y);
     void SDL_SetWindowMinimumSize(SDL_Window *window, int min_w, int min_h);
+    void SDL_RestoreWindow(SDL_Window *window);
+    int SDL_GetWindowDisplayIndex(SDL_Window *window);
+    int SDL_GetDisplayBounds(int displayIndex, SDL_Rect *rect);
+    int SDL_GetDisplayUsableBounds(int displayIndex, SDL_Rect *rect);
     void SDL_GetVersion(SDL_version *ver);
     int SDL_GetWindowWMInfo(SDL_Window *window, SDL_SysWMinfo *info);
 
@@ -1449,6 +1458,7 @@ local function destroySdlWindow()
   state.pointerDown = false
   state.prevButtons = 0
   state.nativeAspect = false
+  state.sdlHandlingMax = false
   state.lastPresentW, state.lastPresentH = 0, 0
   state.needsRedraw = false
 end
@@ -1619,9 +1629,115 @@ local function presentDestRect(fw, fh)
   return dx, dy, dw, dh, vw, vh, outW, outH
 end
 
+local function flagSet(flags, flag)
+  flags = tonumber(flags) or 0
+  flag = tonumber(flag) or 0
+  if flag <= 0 then return false end
+  if bit and bit.band then
+    return bit.band(flags, flag) ~= 0
+  end
+  return math.floor(flags / flag) % 2 == 1
+end
+
+-- Usable bounds of the display hosting the companion (taskbar excluded when
+-- SDL_GetDisplayUsableBounds is available).
+local function sdlDisplayUsable(window)
+  local sdl, ffi = state.sdl, state.ffi
+  local index = 0
+  if sdl.SDL_GetWindowDisplayIndex then
+    local ok, idx = pcall(function() return sdl.SDL_GetWindowDisplayIndex(window) end)
+    if ok and type(idx) == "number" and idx >= 0 then index = idx end
+  end
+  local rect = ffi.new("SDL_Rect")
+  if sdl.SDL_GetDisplayUsableBounds then
+    local ok, rc = pcall(function() return sdl.SDL_GetDisplayUsableBounds(index, rect) end)
+    if ok and rc == 0 and tonumber(rect.w) > 0 and tonumber(rect.h) > 0 then
+      return tonumber(rect.w), tonumber(rect.h), {
+        x = tonumber(rect.x), y = tonumber(rect.y),
+        w = tonumber(rect.w), h = tonumber(rect.h),
+      }
+    end
+  end
+  if sdl.SDL_GetDisplayBounds then
+    local ok, rc = pcall(function() return sdl.SDL_GetDisplayBounds(index, rect) end)
+    if ok and rc == 0 and tonumber(rect.w) > 0 and tonumber(rect.h) > 0 then
+      return tonumber(rect.w), tonumber(rect.h), {
+        x = tonumber(rect.x), y = tonumber(rect.y),
+        w = tonumber(rect.w), h = tonumber(rect.h),
+      }
+    end
+  end
+  local w, h = windowSize()
+  local x = ffi.new("int[1]")
+  local y = ffi.new("int[1]")
+  sdl.SDL_GetWindowPosition(window, x, y)
+  return w, h, {
+    x = tonumber(x[0]) or 0, y = tonumber(y[0]) or 0, w = w, h = h,
+  }
+end
+
+local function sdlIsExpanded()
+  local sdl = state.sdl
+  if not sdl or state.window == nil then return false end
+  local flags = tonumber(sdl.SDL_GetWindowFlags(state.window)) or 0
+  if flagSet(flags, SDL_WINDOW_MAXIMIZED)
+      or flagSet(flags, SDL_WINDOW_FULLSCREEN)
+      or flagSet(flags, SDL_WINDOW_FULLSCREEN_DESKTOP) then
+    return true
+  end
+  -- Some hosts fill the work area without setting MAXIMIZED.
+  local maxW, maxH = sdlDisplayUsable(state.window)
+  if maxW and maxH and maxW > 0 and maxH > 0 then
+    local cw, ch = windowSize()
+    if cw >= maxW - 16 and ch >= maxH - 16 then
+      return true
+    end
+  end
+  return false
+end
+
+-- Maximize / fullscreen on a 16:9 monitor pillarboxes 160:144 (theme filler
+-- reads as red side bars). Remap to the largest exact 160:144 fit, centered
+-- on the same monitor — same behavior as the Linux X11 path.
+local function sdlApplyMaxAspectFit()
+  local sdl = state.sdl
+  if not sdl or state.window == nil then return end
+  if state.sdlHandlingMax or state.aspectLock then return end
+  state.sdlHandlingMax = true
+  state.aspectLock = true
+
+  local maxW, maxH, mon = sdlDisplayUsable(state.window)
+  maxW = math.max(FRAME_W, math.floor(tonumber(maxW) or FRAME_W * DEFAULT_SCALE))
+  maxH = math.max(FRAME_H, math.floor(tonumber(maxH) or FRAME_H * DEFAULT_SCALE))
+  mon = mon or { x = 0, y = 0, w = maxW, h = maxH }
+  local nw, nh = Bridge.clampAspectToMax(maxW + 1, maxH + 1, maxW, maxH, FRAME_W, FRAME_H)
+  local x = mon.x + math.max(0, math.floor((mon.w - nw) / 2))
+  local y = mon.y + math.max(0, math.floor((mon.h - nh) / 2))
+
+  withHostGL(function()
+    if sdl.SDL_RestoreWindow then
+      pcall(function() sdl.SDL_RestoreWindow(state.window) end)
+    end
+    sdl.SDL_SetWindowSize(state.window, nw, nh)
+    if sdl.SDL_SetWindowPosition then
+      pcall(function() sdl.SDL_SetWindowPosition(state.window, x, y) end)
+    end
+  end)
+
+  state.needsRedraw = true
+  state.aspectLock = false
+  state.sdlHandlingMax = false
+  log("maximize remapped to max 160:144 fit %dx%d on display@%d,%d",
+    nw, nh, mon.x, mon.y)
+end
+
 local function enforceAspect()
   local sdl = state.sdl
   if not sdl or state.window == nil or state.aspectLock then return end
+  if sdlIsExpanded() then
+    sdlApplyMaxAspectFit()
+    return
+  end
   local cw, ch = windowSize()
   local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
   if nw == cw and nh == ch then return end
@@ -1782,6 +1898,10 @@ local function drainWindowEvents()
         destroyWindow()
         enqueueTouch("cancel,0,0")
         return
+      elseif kind == 8 then
+        -- MAXIMIZED: remap to max 160:144 fit (no red pillarbox bars).
+        state.needsRedraw = true
+        sdlApplyMaxAspectFit()
       elseif kind == 5 or kind == 6 then
         -- SIZE_CHANGED / RESIZED: snap aspect and mark for pinned redraw.
         state.needsRedraw = true

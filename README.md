@@ -134,7 +134,10 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
   companion prefers a software SDL renderer and snaps aspect after resize
   (it does not hook `WM_SIZING` through SDL SysWM on LÖVE's shared event queue).
   Live resize re-blits the last companion frame every poll so the UI tracks the
-  window instead of leaving black gutters until the next dirty present.
+  window instead of leaving black gutters until the next dirty present. Maximize
+  / fullscreen is remapped to the largest 160∶144 window that fits the current
+  display (centered), matching Linux, so a 16:9 maximize does not leave red
+  side bars.
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need
