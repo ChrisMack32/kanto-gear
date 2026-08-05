@@ -79,6 +79,24 @@ function Bridge.constrainAspectDrag(w, h, prevW, prevH, fw, fh)
   return w, h, widthDriven
 end
 
+-- Largest fw:fh window that fits inside maxW×maxH. Used when a drag would
+-- otherwise ask for a taller-than-screen 160:144 size on a 16:9 monitor.
+-- Oversized proposals snap to an integer multiple of the GB frame so the
+-- ratio stays exact (avoids pillarbox bars from a WM-clamped 16:9 size).
+function Bridge.clampAspectToMax(w, h, maxW, maxH, fw, fh)
+  fw = fw or FRAME_W
+  fh = fh or FRAME_H
+  w = math.max(fw, math.floor(tonumber(w) or fw))
+  h = math.max(fh, math.floor(tonumber(h) or fh))
+  maxW = math.max(fw, math.floor(tonumber(maxW) or w))
+  maxH = math.max(fh, math.floor(tonumber(maxH) or h))
+  if w <= maxW and h <= maxH then
+    return w, h
+  end
+  local iscale = math.max(1, math.floor(math.min(maxW / fw, maxH / fh)))
+  return fw * iscale, fh * iscale
+end
+
 function Bridge.logicalPoint(x, y, vw, vh, fw, fh)
   fw = fw or FRAME_W
   fh = fh or FRAME_H
@@ -737,9 +755,10 @@ local function x11WindowSize()
   return state.xWinW, state.xWinH
 end
 
--- Maximized / fullscreen (or nearly monitor-sized): keep the WM size and
--- letterbox the GB frame. Forcing 160:144 here queues a taller-than-screen
--- configure that many WMs apply on the next click and clips the UI.
+-- Maximized / fullscreen via EWMH: keep the WM size and letterbox.
+-- Do not treat "merely large" windows as expanded — on a 16:9 monitor a
+-- big manual drag must still snap to the largest fitting 160:144 size,
+-- otherwise pillarbox bars appear and the aspect lock looks broken.
 local function x11IsExpanded(cw, ch)
   local x11, ffi = state.x11, state.ffi
   if not x11 or state.xDisplay == nil or state.xWindow == nil then return false end
@@ -752,13 +771,13 @@ local function x11IsExpanded(cw, ch)
     local nitems = ffi.new("unsigned long[1]")
     local bytesAfter = ffi.new("unsigned long[1]")
     local prop = ffi.new("unsigned char *[1]")
-    local ok = pcall(function()
+    local statusOk, status = pcall(function()
       return x11.XGetWindowProperty(
         state.xDisplay, state.xWindow, state.xAtomNetWmState,
         0, 64, 0, 0, -- AnyPropertyType = 0
         actualType, actualFormat, nitems, bytesAfter, prop)
     end)
-    if ok and prop[0] ~= nil then
+    if statusOk and prop[0] ~= nil then
       local count = tonumber(nitems[0]) or 0
       local atoms = ffi.cast("Atom *", prop[0])
       local expanded = false
@@ -777,14 +796,41 @@ local function x11IsExpanded(cw, ch)
     end
   end
 
+  -- Strict fallback only when the window truly fills the display (both axes).
   if x11.XDisplayWidth and x11.XDisplayHeight and cw and ch then
     local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or 0
     local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or 0
-    if sw > 0 and sh > 0 and cw >= sw - 16 and ch >= sh - 80 then
+    if sw > 0 and sh > 0 and cw >= sw - 8 and ch >= sh - 8 then
       return true
     end
   end
   return false
+end
+
+local function x11UsableMax()
+  local x11 = state.x11
+  if not (x11 and x11.XDisplayWidth and state.xDisplay) then
+    return nil, nil
+  end
+  local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or 0
+  local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or 0
+  if sw <= 0 or sh <= 0 then return nil, nil end
+  -- Leave room for decorations / panels so the WM can actually apply the size.
+  return math.max(FRAME_W, sw - 16), math.max(FRAME_H, sh - 64)
+end
+
+local function x11SnapSize(cw, ch, prevW, prevH, absolute)
+  local nw, nh
+  if absolute then
+    nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
+  else
+    nw, nh = Bridge.constrainAspectDrag(cw, ch, prevW, prevH, FRAME_W, FRAME_H)
+  end
+  local maxW, maxH = x11UsableMax()
+  if maxW and maxH then
+    nw, nh = Bridge.clampAspectToMax(nw, nh, maxW, maxH, FRAME_W, FRAME_H)
+  end
+  return nw, nh
 end
 
 local function x11ApplySize(nw, nh)
@@ -793,6 +839,10 @@ local function x11ApplySize(nw, nh)
   if x11IsExpanded(state.xWinW, state.xWinH) then
     state.xExpanded = true
     return
+  end
+  local maxW, maxH = x11UsableMax()
+  if maxW and maxH then
+    nw, nh = Bridge.clampAspectToMax(nw, nh, maxW, maxH, FRAME_W, FRAME_H)
   end
   nw = math.max(FRAME_W, math.floor(nw))
   nh = math.max(FRAME_H, math.floor(nh))
@@ -841,13 +891,7 @@ local function x11EnforceAspect(force)
   state.xExpanded = false
   local prevW = state.lastLockedW > 0 and state.lastLockedW or cw
   local prevH = state.lastLockedH > 0 and state.lastLockedH or ch
-  local nw, nh
-  if wasExpanded or state.pendingAspectSnap then
-    -- Restored from maximize (or still settling): snap from absolute size.
-    nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
-  else
-    nw, nh = Bridge.constrainAspectDrag(cw, ch, prevW, prevH, FRAME_W, FRAME_H)
-  end
+  local nw, nh = x11SnapSize(cw, ch, prevW, prevH, wasExpanded or state.pendingAspectSnap)
   if nw == cw and nh == ch then
     state.lastLockedW, state.lastLockedH = cw, ch
     state.pendingAspectSnap = false
@@ -984,14 +1028,10 @@ local function x11DrainEvents()
         state.pendingAspectSnap = true
       end
       state.xExpanded = false
-      local nw, nh
-      if wasExpanded or state.pendingAspectSnap then
-        nw, nh = Bridge.constrainAspect(cfgW, cfgH, FRAME_W, FRAME_H)
-      else
-        local prevW = state.lastLockedW > 0 and state.lastLockedW or cfgW
-        local prevH = state.lastLockedH > 0 and state.lastLockedH or cfgH
-        nw, nh = Bridge.constrainAspectDrag(cfgW, cfgH, prevW, prevH, FRAME_W, FRAME_H)
-      end
+      local prevW = state.lastLockedW > 0 and state.lastLockedW or cfgW
+      local prevH = state.lastLockedH > 0 and state.lastLockedH or cfgH
+      local nw, nh = x11SnapSize(cfgW, cfgH, prevW, prevH,
+        wasExpanded or state.pendingAspectSnap)
       if nw ~= cfgW or nh ~= cfgH then
         x11ApplySize(nw, nh)
         local guard = 0

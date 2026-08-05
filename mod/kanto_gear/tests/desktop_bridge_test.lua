@@ -100,6 +100,20 @@ do
   eq(h, 900, "tall drag keeps proposed height")
 end
 
+-- Clamp oversized 160:144 proposals to fit a 16:9 monitor
+do
+  local w, h = Bridge.clampAspectToMax(1920, 1728, 1904, 1016, 160, 144)
+  check(w <= 1904 and h <= 1016, "clamped inside 16:9 usable area")
+  eq(w * 144, h * 160, "clamped size keeps aspect product")
+  eq(w, 1120, "16:9 clamp uses integer GB scale width")
+  eq(h, 1008, "16:9 clamp uses integer GB scale height")
+end
+do
+  local w, h = Bridge.clampAspectToMax(800, 720, 1904, 1016, 160, 144)
+  eq(w, 800, "already-fitting width unchanged")
+  eq(h, 720, "already-fitting height unchanged")
+end
+
 -- rgb24 helper
 do
   local r, g, b = Bridge.rgb24ToFloat(0x0F380F)
