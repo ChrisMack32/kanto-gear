@@ -395,7 +395,9 @@ local function defineSDL(ffi)
       uint32_t type;
       SDL_WindowEvent window;
       SDL_SysWMEvent syswm;
-      uint8_t padding[128];
+      // SDL2 ABI: sizeof(SDL_Event) is 56 on 64-bit. A larger padding makes
+      // SDL_PeepEvents array strides wrong and corrupts the shared host queue.
+      uint8_t padding[56];
     } SDL_Event;
 
     typedef struct SDL_version {
@@ -1541,26 +1543,9 @@ local function applyWinSizing(rect, edge)
   end
 end
 
-local function enableWindowsSizingHook()
-  local sdl, ffi = state.sdl, state.ffi
-  if ffi.os ~= "Windows" or not sdl.SDL_EventState then return end
-  pcall(function()
-    ffi.cdef[[
-      typedef struct { long left, top, right, bottom; } RECT;
-      typedef struct SDL_SysWMmsg_Win {
-        SDL_version version;
-        int subsystem;
-        void *hwnd;
-        unsigned int msg;
-        uint64_t wParam;
-        int64_t lParam;
-      } SDL_SysWMmsg_Win;
-    ]]
-  end)
-  sdl.SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE)
-  state.nativeAspect = true
-  log("Windows WM_SIZING aspect hook enabled")
-end
+-- Kept for unit tests / possible future SetWindowsMessageHook; not used on the
+-- shared LÖVE SDL queue (deferred WM_SIZING RECT* is use-after-free).
+Bridge._applyWinSizing = applyWinSizing
 
 local function lockNativeAspect(window)
   local ffi = state.ffi
@@ -1573,9 +1558,13 @@ local function lockNativeAspect(window)
   if ffi.os == "OSX" then
     return lockAspectCocoa(handle)
   elseif ffi.os == "Windows" then
+    -- Do NOT enable SDL_SYSWMEVENT / peep WM_SIZING on the shared LÖVE queue:
+    -- RECT* is only valid during the native message, and PeepEvents+PushEvent
+    -- of SysWM batches hard-crashed Gen1Recomp a few seconds after open.
+    -- Snap 160:144 after SIZE_CHANGED via enforceAspect instead.
     state.hwnd = handle
-    enableWindowsSizingHook()
-    return true
+    log("Windows companion uses post-resize aspect snap (no SysWM hook)")
+    return false
   end
   return false
 end
@@ -1640,12 +1629,24 @@ local function enforceAspect()
 end
 
 local function createCompanionRenderer(sdl, window)
-  local attempts = {
-    SDL_RENDERER_ACCELERATED + SDL_RENDERER_PRESENTVSYNC,
-    SDL_RENDERER_ACCELERATED,
-    SDL_RENDERER_SOFTWARE,
-    0,
-  }
+  -- Prefer software on Windows: a second accelerated renderer next to LÖVE's
+  -- GL/D3D path has been a hard-crash source (same class of failure as Linux
+  -- dual-SDL). macOS keeps accelerated first (Retina path is proven).
+  local attempts
+  if state.ffi and state.ffi.os == "Windows" then
+    attempts = {
+      SDL_RENDERER_SOFTWARE,
+      SDL_RENDERER_ACCELERATED,
+      0,
+    }
+  else
+    attempts = {
+      SDL_RENDERER_ACCELERATED + SDL_RENDERER_PRESENTVSYNC,
+      SDL_RENDERER_ACCELERATED,
+      SDL_RENDERER_SOFTWARE,
+      0,
+    }
+  end
   for _, flags in ipairs(attempts) do
     local renderer = sdl.SDL_CreateRenderer(window, -1, flags)
     if renderer ~= nil then
@@ -1720,49 +1721,18 @@ local function mainWindowOpen()
   return true
 end
 
-local function handleSysWM(ev)
-  if state.ffi.os ~= "Windows" or not state.window then return end
-  local ffi = state.ffi
-  local msg = ev.syswm.msg
-  if msg == nil then return end
-  local ok, wm = pcall(function()
-    return ffi.cast("SDL_SysWMmsg_Win*", msg)
-  end)
-  if not ok or wm == nil then return end
-  if tonumber(wm.msg) ~= WM_SIZING then return end
-  if state.hwnd ~= nil and wm.hwnd ~= nil and wm.hwnd ~= state.hwnd then
-    return
-  end
-  local rect = ffi.cast("RECT*", wm.lParam)
-  if rect ~= nil then
-    applyWinSizing(rect, wm.wParam)
-  end
-end
-
 local function drainWindowEvents()
   local sdl, ffi = state.sdl, state.ffi
   if not sdl or state.window == nil then return end
-  -- Do not PumpEvents on Linux fallback; LÖVE owns the queue.
-  if ffi.os ~= "Linux" then
-    sdl.SDL_PumpEvents()
-  end
 
-  if ffi.os == "Windows" then
-    local sys = ffi.new("SDL_Event[16]")
-    local n = sdl.SDL_PeepEvents(sys, 16, SDL_GETEVENT, SDL_SYSWMEVENT, SDL_SYSWMEVENT)
-    if n > 0 then
-      for i = 0, n - 1 do
-        handleSysWM(sys[i])
-        sdl.SDL_PushEvent(sys[i])
-      end
-    end
-  end
+  -- Never SDL_PumpEvents here: LÖVE owns the shared SDL event queue on every
+  -- desktop OS. Mid-frame PumpEvents + SysWM peeks hard-crashed Windows hosts.
+  -- Also peep one WINDOWEVENT at a time with the correct 56-byte SDL_Event.
 
-  local events = ffi.new("SDL_Event[32]")
-  local n = sdl.SDL_PeepEvents(events, 32, SDL_GETEVENT, SDL_WINDOWEVENT, SDL_WINDOWEVENT)
-  if n < 0 then return end
-  for i = 0, n - 1 do
-    local ev = events[i]
+  local ev = ffi.new("SDL_Event")
+  for _ = 1, 32 do
+    local n = sdl.SDL_PeepEvents(ev, 1, SDL_GETEVENT, SDL_WINDOWEVENT, SDL_WINDOWEVENT)
+    if n <= 0 then break end
     local kind = ev.window.event
     if ev.window.windowID == state.windowId then
       if kind == 14 then
@@ -1770,6 +1740,7 @@ local function drainWindowEvents()
         state.userClosed = true
         destroyWindow()
         enqueueTouch("cancel,0,0")
+        return
       elseif kind == 5 or kind == 6 then
         enforceAspect()
       end
@@ -1777,7 +1748,10 @@ local function drainWindowEvents()
       if kind == 14 then
         log("host window closed; closing companion")
         destroyWindow()
+        sdl.SDL_PushEvent(ev)
+        return
       end
+      -- Leave host window events for LÖVE.
       sdl.SDL_PushEvent(ev)
     end
   end
@@ -2021,6 +1995,10 @@ local function initSdlBackend(ffi)
   state.ffi, state.sdl = ffi, sdl
   state.backend = "sdl"
   state.usable = true
+  -- Ensure SysWM stays off on the shared LÖVE queue (older builds enabled it).
+  if ffi.os == "Windows" and sdl.SDL_EventState then
+    pcall(function() sdl.SDL_EventState(SDL_SYSWMEVENT, 0) end)
+  end
   log("desktop bridge ready via SDL %s (%s)", tostring(sdlName), tostring(ffi.os))
   return true
 end

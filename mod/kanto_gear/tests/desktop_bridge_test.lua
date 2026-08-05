@@ -141,6 +141,15 @@ do
   eq(oh, 432, "1x dh unchanged")
 end
 
+-- Windows aspect helper (post-resize path; SysWM hook removed)
+do
+  local rect = { left = 100, top = 50, right = 600, bottom = 400 }
+  Bridge._applyWinSizing(rect, 2) -- WMSZ_RIGHT
+  eq(rect.left, 100, "right-edge resize keeps left")
+  eq((rect.right - rect.left) * 144, (rect.bottom - rect.top) * 160,
+    "right-edge resize keeps aspect product")
+end
+
 -- rgb24 helper
 do
   local r, g, b = Bridge.rgb24ToFloat(0x0F380F)
