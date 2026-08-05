@@ -100,6 +100,9 @@ local state = {
   xWmDelete = nil,
   xWinW = 0,
   xWinH = 0,
+  needsRedraw = false,
+  aspectTargetW = 0,
+  aspectTargetH = 0,
   bg = 0x0F380F,
   touches = {},
   prevButtons = 0,
@@ -142,6 +145,7 @@ local X_ButtonPressMask = 4
 local X_ButtonReleaseMask = 8
 local X_ExposureMask = 32768
 local X_StructureNotifyMask = 131072
+local X_Expose = 12
 local X_ClientMessage = 33
 local X_DestroyNotify = 17
 local X_ConfigureNotify = 22
@@ -150,6 +154,7 @@ local X_ButtonRelease = 5
 local X_ZPixmap = 2
 local X_PMinSize = 16
 local X_PAspect = 256
+local X_PBaseSize = 512
 
 local function breadcrumb(msg)
   pcall(function()
@@ -509,6 +514,7 @@ local function defineX11(ffi)
     int XPending(Display *display);
     int XNextEvent(Display *display, XEvent *event_return);
     int XFlush(Display *display);
+    int XSync(Display *display, int discard);
     int XDestroyWindow(Display *display, Window w);
     int XResizeWindow(Display *display, Window w, unsigned int width, unsigned int height);
     int XGetGeometry(Display *display, Drawable d, Window *root,
@@ -636,8 +642,9 @@ local function x11EnsureWindow()
   x11.XSetWMProtocols(state.xDisplay, win, protocols, 1)
 
   local hints = state.ffi.new("XSizeHints")
-  hints.flags = X_PMinSize + X_PAspect
+  hints.flags = X_PMinSize + X_PAspect + X_PBaseSize
   hints.min_width, hints.min_height = FRAME_W, FRAME_H
+  hints.base_width, hints.base_height = FRAME_W, FRAME_H
   hints.min_aspect.x, hints.min_aspect.y = FRAME_W, FRAME_H
   hints.max_aspect.x, hints.max_aspect.y = FRAME_W, FRAME_H
   x11.XSetWMNormalHints(state.xDisplay, win, hints)
@@ -673,84 +680,41 @@ local function x11WindowSize()
   return state.xWinW, state.xWinH
 end
 
-local function x11DrainEvents()
-  local ffi, x11 = state.ffi, state.x11
-  if not x11 or state.xDisplay == nil or state.xWindow == nil then return end
-  local ev = ffi.new("XEvent")
-  while x11.XPending(state.xDisplay) > 0 do
-    x11.XNextEvent(state.xDisplay, ev)
-    local t = ev.type
-    if t == X_ClientMessage then
-      if ev.xclient.window == state.xWindow then
-        local atom = tonumber(ffi.cast("unsigned long", ev.xclient.data_l[0]))
-        local del = tonumber(ffi.cast("unsigned long", state.xWmDelete))
-        if atom ~= nil and atom == del then
-          log("x11 companion closed by user")
-          state.userClosed = true
-          x11DestroyWindow()
-          enqueueTouch("cancel,0,0")
-          return
-        end
-      end
-    elseif t == X_DestroyNotify then
-      if state.xWindow ~= nil then
-        state.userClosed = true
-        x11DestroyWindow()
-        enqueueTouch("cancel,0,0")
-        return
-      end
-    elseif t == X_ConfigureNotify then
-      if ev.xconfigure.window == state.xWindow then
-        local cw = tonumber(ev.xconfigure.width) or state.xWinW
-        local ch = tonumber(ev.xconfigure.height) or state.xWinH
-        local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
-        state.xWinW, state.xWinH = cw, ch
-        if not state.aspectLock and (nw ~= cw or nh ~= ch) then
-          state.aspectLock = true
-          x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
-          state.xWinW, state.xWinH = nw, nh
-          state.aspectLock = false
-        end
-      end
-    elseif t == X_ButtonPress or t == X_ButtonRelease then
-      if ev.xbutton.window == state.xWindow and ev.xbutton.button == 1 then
-        local vw, vh = x11WindowSize()
-        local x = tonumber(ev.xbutton.x) or 0
-        local y = tonumber(ev.xbutton.y) or 0
-        local lx, ly = Bridge.logicalPoint(x, y, vw, vh, state.frameW, state.frameH)
-        if t == X_ButtonPress then
-          if lx then
-            state.pointerDown = true
-            enqueueTouch(string.format("down,%d,%d", lx, ly))
-          end
-        else
-          if state.pointerDown then
-            if not lx then
-              lx = math.min(state.frameW - 1, math.max(0, math.floor(x * state.frameW / math.max(1, vw))))
-              ly = math.min(state.frameH - 1, math.max(0, math.floor(y * state.frameH / math.max(1, vh))))
-            end
-            state.pointerDown = false
-            enqueueTouch(string.format("up,%d,%d", lx, ly))
-          end
-        end
-      end
-    end
+-- Snap the OS window onto 160:144. Many WMs ignore PAspect during live
+-- drag, so we correct with XResizeWindow and also use the snapped size for
+-- the next blit even before the ConfigureNotify lands.
+local function x11EnforceAspect(force)
+  if state.xWindow == nil or not state.x11 then return state.xWinW, state.xWinH end
+  if state.aspectLock and not force then return state.xWinW, state.xWinH end
+  local cw, ch = x11WindowSize()
+  local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
+  if nw == cw and nh == ch then
+    state.aspectLock = false
+    return cw, ch
   end
+  state.aspectLock = true
+  state.aspectTargetW, state.aspectTargetH = nw, nh
+  pcall(function()
+    state.x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
+    state.x11.XSync(state.xDisplay, 0)
+  end)
+  state.xWinW, state.xWinH = nw, nh
+  state.needsRedraw = true
+  -- Allow further corrects on the next event; Sync should have applied.
+  state.aspectLock = false
+  return nw, nh
 end
 
-local function x11Present(imageData, backgroundColor)
-  if not x11EnsureWindow() then return false end
-  state.bg = backgroundColor or state.bg
-  state.pinImage = imageData
+local function x11Blit(imageData)
+  if state.xWindow == nil or imageData == nil then return false end
+  if not imageData.getWidth or not imageData.getFFIPointer then return false end
 
   local fw = imageData:getWidth()
   local fh = imageData:getHeight()
+  if fw <= 0 or fh <= 0 then return false end
   state.frameW, state.frameH = fw, fh
 
-  x11DrainEvents()
-  if state.xWindow == nil then return false end
-
-  local vw, vh = x11WindowSize()
+  local vw, vh = x11EnforceAspect(false)
   if vw < 1 or vh < 1 then return false end
   if not x11EnsureImage(vw, vh) then return false end
 
@@ -784,9 +748,101 @@ local function x11Present(imageData, backgroundColor)
     state.xDisplay, state.xWindow, state.xGc, state.xImage,
     0, 0, 0, 0, vw, vh)
   state.x11.XFlush(state.xDisplay)
-  -- Keep ImageData alive across the FFI pointer use.
-  state.pinImage = imageData
+  state.needsRedraw = false
   return true
+end
+
+local function x11DrainEvents()
+  local ffi, x11 = state.ffi, state.x11
+  if not x11 or state.xDisplay == nil or state.xWindow == nil then return end
+  local ev = ffi.new("XEvent")
+  local resized = false
+  while x11.XPending(state.xDisplay) > 0 do
+    x11.XNextEvent(state.xDisplay, ev)
+    local t = ev.type
+    if t == X_ClientMessage then
+      if ev.xclient.window == state.xWindow then
+        local atom = tonumber(ffi.cast("unsigned long", ev.xclient.data_l[0]))
+        local del = tonumber(ffi.cast("unsigned long", state.xWmDelete))
+        if atom ~= nil and atom == del then
+          log("x11 companion closed by user")
+          state.userClosed = true
+          x11DestroyWindow()
+          enqueueTouch("cancel,0,0")
+          return
+        end
+      end
+    elseif t == X_DestroyNotify then
+      if state.xWindow ~= nil then
+        state.userClosed = true
+        x11DestroyWindow()
+        enqueueTouch("cancel,0,0")
+        return
+      end
+    elseif t == X_ConfigureNotify then
+      if ev.xconfigure.window == state.xWindow then
+        local cw = tonumber(ev.xconfigure.width) or state.xWinW
+        local ch = tonumber(ev.xconfigure.height) or state.xWinH
+        state.xWinW, state.xWinH = cw, ch
+        state.needsRedraw = true
+        local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
+        if (nw ~= cw or nh ~= ch) and not resized then
+          resized = true
+          state.aspectTargetW, state.aspectTargetH = nw, nh
+          pcall(function()
+            x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
+          end)
+          state.xWinW, state.xWinH = nw, nh
+        end
+      end
+    elseif t == X_Expose then
+      -- count==0 means this is the last expose in a batch
+      state.needsRedraw = true
+    elseif t == X_ButtonPress or t == X_ButtonRelease then
+      if ev.xbutton.window == state.xWindow and ev.xbutton.button == 1 then
+        local vw, vh = x11WindowSize()
+        local x = tonumber(ev.xbutton.x) or 0
+        local y = tonumber(ev.xbutton.y) or 0
+        local lx, ly = Bridge.logicalPoint(x, y, vw, vh, state.frameW, state.frameH)
+        if t == X_ButtonPress then
+          if lx then
+            state.pointerDown = true
+            enqueueTouch(string.format("down,%d,%d", lx, ly))
+          end
+        else
+          if state.pointerDown then
+            if not lx then
+              lx = math.min(state.frameW - 1, math.max(0, math.floor(x * state.frameW / math.max(1, vw))))
+              ly = math.min(state.frameH - 1, math.max(0, math.floor(y * state.frameH / math.max(1, vh))))
+            end
+            state.pointerDown = false
+            enqueueTouch(string.format("up,%d,%d", lx, ly))
+          end
+        end
+      end
+    end
+  end
+  if resized then
+    pcall(function() x11.XSync(state.xDisplay, 0) end)
+  end
+  -- Live resize clears the X11 backing store; repaint from the last frame
+  -- immediately so the window does not stay black until the next game tick.
+  if state.needsRedraw and state.pinImage ~= nil and state.xWindow ~= nil then
+    pcall(x11Blit, state.pinImage)
+  end
+end
+
+local function x11Present(imageData, backgroundColor)
+  if not x11EnsureWindow() then return false end
+  state.bg = backgroundColor or state.bg
+  state.pinImage = imageData
+
+  x11DrainEvents()
+  if state.xWindow == nil then return false end
+
+  local ok = x11Blit(imageData)
+  state.pinImage = imageData
+  return ok
 end
 
 local function initX11Backend(ffi)
@@ -801,6 +857,9 @@ local function initX11Backend(ffi)
     return false
   end
   pcall(function() x11.XInitThreads() end)
+  pcall(function()
+    ffi.cdef[[ int XSync(Display *display, int discard); ]]
+  end)
   local display = x11.XOpenDisplay(nil)
   if display == nil then
     warn("XOpenDisplay failed (Wayland-only session?)")
@@ -1297,7 +1356,17 @@ local function pollSecondaryDisplayTouch()
     return nil
   end
   if state.backend == "x11" then
-    if state.xWindow ~= nil then x11DrainEvents() end
+    if state.xWindow ~= nil then
+      x11DrainEvents()
+      if state.xWindow ~= nil then
+        -- Snap aspect even when the WM silently ignored PAspect / our
+        -- mid-drag XResizeWindow (common on Mutter / KWin).
+        x11EnforceAspect(false)
+        if state.needsRedraw and state.pinImage ~= nil then
+          pcall(x11Blit, state.pinImage)
+        end
+      end
+    end
   else
     drainWindowEvents()
     if state.window ~= nil then
