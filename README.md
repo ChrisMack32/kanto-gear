@@ -130,7 +130,9 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
   multi-monitor setups the max-fit window stays on the monitor the companion
   was already on. On Retina/HiDPI macOS the companion draws into the full
   drawable (window points vs renderer pixels), so the UI fills the window
-  instead of sitting in a corner with theme-colored gutters.
+  instead of sitting in a corner with theme-colored gutters. On Windows the
+  companion prefers a software SDL renderer and snaps aspect after resize
+  (it does not hook `WM_SIZING` through SDL SysWM on LÖVE's shared event queue).
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need
