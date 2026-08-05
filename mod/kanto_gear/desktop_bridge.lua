@@ -134,6 +134,12 @@ local state = {
   aspectTargetH = 0,
   lastLockedW = 0,
   lastLockedH = 0,
+  xExpanded = false, -- maximized / fullscreen: letterbox only, do not snap
+  pendingAspectSnap = false, -- after unmaximize, keep absolute snapping until locked
+  xAtomNetWmState = nil,
+  xAtomMaxHorz = nil,
+  xAtomMaxVert = nil,
+  xAtomFullscreen = nil,
   bg = 0x0F380F,
   touches = {},
   prevButtons = 0,
@@ -565,6 +571,14 @@ local function defineX11(ffi)
     Atom XInternAtom(Display *display, const char *atom_name, int only_if_exists);
     int XSetWMProtocols(Display *display, Window w, Atom *protocols, int count);
     void XSetWMNormalHints(Display *display, Window w, XSizeHints *hints);
+    int XGetWindowProperty(Display *display, Window w, Atom property,
+      long long_offset, long long_length, int delete, Atom req_type,
+      Atom *actual_type_return, int *actual_format_return,
+      unsigned long *nitems_return, unsigned long *bytes_after_return,
+      unsigned char **prop_return);
+    int XFree(void *data);
+    int XDisplayWidth(Display *display, int screen_number);
+    int XDisplayHeight(Display *display, int screen_number);
     XImage *XCreateImage(Display *display, void *visual, unsigned int depth,
       int format, int offset, char *data, unsigned int width, unsigned int height,
       int bitmap_pad, int bytes_per_line);
@@ -723,9 +737,63 @@ local function x11WindowSize()
   return state.xWinW, state.xWinH
 end
 
+-- Maximized / fullscreen (or nearly monitor-sized): keep the WM size and
+-- letterbox the GB frame. Forcing 160:144 here queues a taller-than-screen
+-- configure that many WMs apply on the next click and clips the UI.
+local function x11IsExpanded(cw, ch)
+  local x11, ffi = state.x11, state.ffi
+  if not x11 or state.xDisplay == nil or state.xWindow == nil then return false end
+  cw = cw or state.xWinW
+  ch = ch or state.xWinH
+
+  if state.xAtomNetWmState ~= nil and x11.XGetWindowProperty then
+    local actualType = ffi.new("Atom[1]")
+    local actualFormat = ffi.new("int[1]")
+    local nitems = ffi.new("unsigned long[1]")
+    local bytesAfter = ffi.new("unsigned long[1]")
+    local prop = ffi.new("unsigned char *[1]")
+    local ok = pcall(function()
+      return x11.XGetWindowProperty(
+        state.xDisplay, state.xWindow, state.xAtomNetWmState,
+        0, 64, 0, 0, -- AnyPropertyType = 0
+        actualType, actualFormat, nitems, bytesAfter, prop)
+    end)
+    if ok and prop[0] ~= nil then
+      local count = tonumber(nitems[0]) or 0
+      local atoms = ffi.cast("Atom *", prop[0])
+      local expanded = false
+      for i = 0, count - 1 do
+        local a = atoms[i]
+        if a == state.xAtomMaxHorz or a == state.xAtomMaxVert
+            or a == state.xAtomFullscreen then
+          expanded = true
+          break
+        end
+      end
+      pcall(function() x11.XFree(prop[0]) end)
+      if expanded then return true end
+    elseif prop[0] ~= nil then
+      pcall(function() x11.XFree(prop[0]) end)
+    end
+  end
+
+  if x11.XDisplayWidth and x11.XDisplayHeight and cw and ch then
+    local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or 0
+    local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or 0
+    if sw > 0 and sh > 0 and cw >= sw - 16 and ch >= sh - 80 then
+      return true
+    end
+  end
+  return false
+end
+
 local function x11ApplySize(nw, nh)
   local ffi, x11 = state.ffi, state.x11
   if not x11 or state.xWindow == nil then return end
+  if x11IsExpanded(state.xWinW, state.xWinH) then
+    state.xExpanded = true
+    return
+  end
   nw = math.max(FRAME_W, math.floor(nw))
   nh = math.max(FRAME_H, math.floor(nh))
   state.aspectTargetW, state.aspectTargetH = nw, nh
@@ -744,28 +812,51 @@ local function x11ApplySize(nw, nh)
       x11.XFlush(state.xDisplay)
     end
   end)
-  state.xWinW, state.xWinH = nw, nh
-  state.lastLockedW, state.lastLockedH = nw, nh
+  -- Read back the real size. Updating lastLocked to a size the WM refused
+  -- poisons the next drag snap (common right after unmaximize).
+  local aw, ah = x11WindowSize()
+  state.xWinW, state.xWinH = aw, ah
+  if aw == nw and ah == nh then
+    state.lastLockedW, state.lastLockedH = nw, nh
+    state.pendingAspectSnap = false
+  end
   state.needsRedraw = true
 end
 
 -- Snap the OS window onto 160:144. Many WMs ignore PAspect during live
 -- drag; we keep forcing the locked size from the dominant drag axis.
+-- Skipped while maximized/fullscreen so letterboxing owns the aspect.
 local function x11EnforceAspect(force)
   if state.xWindow == nil or not state.x11 then return state.xWinW, state.xWinH end
   if state.aspectLock and not force then return state.xWinW, state.xWinH end
   local cw, ch = x11WindowSize()
+  if x11IsExpanded(cw, ch) then
+    state.xExpanded = true
+    return cw, ch
+  end
+  local wasExpanded = state.xExpanded
+  if wasExpanded then
+    state.pendingAspectSnap = true
+  end
+  state.xExpanded = false
   local prevW = state.lastLockedW > 0 and state.lastLockedW or cw
   local prevH = state.lastLockedH > 0 and state.lastLockedH or ch
-  local nw, nh = Bridge.constrainAspectDrag(cw, ch, prevW, prevH, FRAME_W, FRAME_H)
+  local nw, nh
+  if wasExpanded or state.pendingAspectSnap then
+    -- Restored from maximize (or still settling): snap from absolute size.
+    nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
+  else
+    nw, nh = Bridge.constrainAspectDrag(cw, ch, prevW, prevH, FRAME_W, FRAME_H)
+  end
   if nw == cw and nh == ch then
     state.lastLockedW, state.lastLockedH = cw, ch
+    state.pendingAspectSnap = false
     return cw, ch
   end
   state.aspectLock = true
   x11ApplySize(nw, nh)
   state.aspectLock = false
-  return nw, nh
+  return state.xWinW, state.xWinH
 end
 
 local function x11Blit(imageData)
@@ -777,7 +868,12 @@ local function x11Blit(imageData)
   if fw <= 0 or fh <= 0 then return false end
   state.frameW, state.frameH = fw, fh
 
-  local vw, vh = x11EnforceAspect(true)
+  local vw, vh = x11WindowSize()
+  if x11IsExpanded(vw, vh) then
+    state.xExpanded = true
+  else
+    vw, vh = x11EnforceAspect(true)
+  end
   if vw < 1 or vh < 1 then return false end
   if not x11EnsureImage(vw, vh) then return false end
 
@@ -878,34 +974,48 @@ local function x11DrainEvents()
   end
 
   if cfgW and cfgH and state.xWindow ~= nil then
-    local prevW = state.lastLockedW > 0 and state.lastLockedW or cfgW
-    local prevH = state.lastLockedH > 0 and state.lastLockedH or cfgH
-    local nw, nh = Bridge.constrainAspectDrag(cfgW, cfgH, prevW, prevH, FRAME_W, FRAME_H)
     state.xWinW, state.xWinH = cfgW, cfgH
-    if nw ~= cfgW or nh ~= cfgH then
-      x11ApplySize(nw, nh)
-      -- Eat follow-up configures from our own snap so the next drain does
-      -- not treat them as a new user drag away from the lock.
-      local guard = 0
-      while guard < 16 and x11.XPending(state.xDisplay) > 0 do
-        guard = guard + 1
-        x11.XNextEvent(state.xDisplay, ev)
-        if ev.type == X_ConfigureNotify and ev.xconfigure.window == state.xWindow then
-          local aw = tonumber(ev.xconfigure.width) or nw
-          local ah = tonumber(ev.xconfigure.height) or nh
-          if aw ~= nw or ah ~= nh then
-            x11ApplySize(nw, nh)
-          else
-            state.xWinW, state.xWinH = aw, ah
-            state.lastLockedW, state.lastLockedH = aw, ah
-          end
-        elseif ev.type == X_Expose then
-          state.needsRedraw = true
-        elseif ev.type == X_ClientMessage or ev.type == X_DestroyNotify
-            or ev.type == X_ButtonPress or ev.type == X_ButtonRelease then
-          -- Put non-configure events back by handling them on next poll; for
-          -- close/destroy handle immediately.
-          if ev.type == X_ClientMessage then
+    if x11IsExpanded(cfgW, cfgH) then
+      state.xExpanded = true
+      -- Keep lastLocked at the pre-maximize size so restore can snap cleanly.
+    else
+      local wasExpanded = state.xExpanded
+      if wasExpanded then
+        state.pendingAspectSnap = true
+      end
+      state.xExpanded = false
+      local nw, nh
+      if wasExpanded or state.pendingAspectSnap then
+        nw, nh = Bridge.constrainAspect(cfgW, cfgH, FRAME_W, FRAME_H)
+      else
+        local prevW = state.lastLockedW > 0 and state.lastLockedW or cfgW
+        local prevH = state.lastLockedH > 0 and state.lastLockedH or cfgH
+        nw, nh = Bridge.constrainAspectDrag(cfgW, cfgH, prevW, prevH, FRAME_W, FRAME_H)
+      end
+      if nw ~= cfgW or nh ~= cfgH then
+        x11ApplySize(nw, nh)
+        local guard = 0
+        while guard < 16 and x11.XPending(state.xDisplay) > 0 do
+          guard = guard + 1
+          x11.XNextEvent(state.xDisplay, ev)
+          if ev.type == X_ConfigureNotify and ev.xconfigure.window == state.xWindow then
+            local aw = tonumber(ev.xconfigure.width) or nw
+            local ah = tonumber(ev.xconfigure.height) or nh
+            if aw ~= nw or ah ~= nh then
+              if not x11IsExpanded(aw, ah) then
+                x11ApplySize(nw, nh)
+              else
+                state.xExpanded = true
+                state.xWinW, state.xWinH = aw, ah
+              end
+            else
+              state.xWinW, state.xWinH = aw, ah
+              state.lastLockedW, state.lastLockedH = aw, ah
+              state.pendingAspectSnap = false
+            end
+          elseif ev.type == X_Expose then
+            state.needsRedraw = true
+          elseif ev.type == X_ClientMessage then
             local atom = tonumber(ffi.cast("unsigned long", ev.xclient.data_l[0]))
             local del = tonumber(ffi.cast("unsigned long", state.xWmDelete))
             if atom == del then
@@ -921,9 +1031,10 @@ local function x11DrainEvents()
             return
           end
         end
+      else
+        state.lastLockedW, state.lastLockedH = cfgW, cfgH
+        state.pendingAspectSnap = false
       end
-    else
-      state.lastLockedW, state.lastLockedH = cfgW, cfgH
     end
   end
 
@@ -986,6 +1097,14 @@ local function initX11Backend(ffi)
   state.xDepth = x11.XDefaultDepth(display, screen)
   state.xGc = x11.XDefaultGC(display, screen)
   state.xWmDelete = x11.XInternAtom(display, "WM_DELETE_WINDOW", 0)
+  state.xAtomNetWmState = x11.XInternAtom(display, "_NET_WM_STATE", 1)
+  state.xAtomMaxHorz = x11.XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_HORZ", 1)
+  state.xAtomMaxVert = x11.XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_VERT", 1)
+  state.xAtomFullscreen = x11.XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", 1)
+  -- only_if_exists=1 can return None(0); treat that as unavailable
+  if state.xAtomNetWmState == nil or state.xAtomNetWmState == 0 then
+    state.xAtomNetWmState = nil
+  end
   state.backend = "x11"
   state.usable = true
   log("desktop bridge ready via X11 (%s) depth=%s", tostring(name), tostring(state.xDepth))
