@@ -654,6 +654,28 @@ return function(mod)
     return fullBottomBattleUI() or mod.options:get("hide_upper_battle_ui")
   end
 
+  -- Stock desktop Gen1Recomp has no secondary-display host APIs. Load the
+  -- SDL companion-window bridge first; Android hosts already expose the
+  -- native APIs and the bridge leaves them alone.
+  local desktopBridge
+  do
+    local source = mod.read and mod:read("desktop_bridge.lua")
+    if source then
+      local chunk, err = load(source, "@" .. tostring(mod.path) .. "/desktop_bridge.lua")
+      if chunk then
+        local ok, result = pcall(chunk)
+        if ok then desktopBridge = result else
+          mod.log:warn("desktop bridge failed to load: %s", tostring(result))
+        end
+      else
+        mod.log:warn("desktop bridge did not compile: %s", tostring(err))
+      end
+    end
+  end
+  if desktopBridge and desktopBridge.install then
+    desktopBridge.install(mod)
+  end
+
   local runtime = rawget(_G, "love")
   local system = runtime and runtime.system
   if not system or not system.hasSecondaryDisplay
@@ -674,8 +696,31 @@ return function(mod)
 
   local canvas = G.newCanvas(WIDTH, HEIGHT, { dpiscale = 1 })
   canvas:setFilter("nearest", "nearest")
-  if not canvas.requestImageData or not canvas.pollImageData then
-    mod.log:warn("host has no asynchronous display readback; mod stays inactive")
+  local requestImageData, pollImageData
+  if canvas.requestImageData and canvas.pollImageData then
+    requestImageData = function() return canvas:requestImageData() end
+    pollImageData = function() return canvas:pollImageData() end
+  elseif canvas.newImageData then
+    -- Stock desktop LÖVE has sync Canvas:newImageData only. Match the
+    -- Android async request/poll shape so pumpDisplay stays unchanged.
+    local pending, pendingData = false, nil
+    requestImageData = function()
+      if pending then return true end
+      local ok, data = pcall(canvas.newImageData, canvas)
+      if not ok or not data then return false end
+      pending, pendingData = true, data
+      return true
+    end
+    pollImageData = function()
+      if not pending then return nil end
+      pending = false
+      local data = pendingData
+      pendingData = nil
+      return data
+    end
+    mod.log:info("using sync canvas readback for desktop companion")
+  else
+    mod.log:warn("host has no canvas readback; mod stays inactive")
     return
   end
   local game
@@ -2211,7 +2256,7 @@ return function(mod)
   local function pumpDisplay()
     local shown = false
     if readbackPending then
-      local image = canvas:pollImageData()
+      local image = pollImageData()
       if image then
         shown = system.presentSecondaryDisplay(image, SECONDARY_BACKGROUND,
           mod.options:get("display_target"))
@@ -2225,7 +2270,7 @@ return function(mod)
     end
     if not readbackPending and dirty then
       draw()
-      if canvas:requestImageData() then
+      if requestImageData() then
         readbackPending = true
         dirty = false
       end
