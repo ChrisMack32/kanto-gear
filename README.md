@@ -137,7 +137,9 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
   window instead of leaving black gutters until the next dirty present. Maximize
   / fullscreen is remapped to the largest 160∶144 window that fits the current
   display (centered), matching Linux, so a 16:9 maximize does not leave red
-  side bars.
+  side bars. The companion never removes host `WINDOWEVENT`s from LÖVE's shared
+  SDL queue (that broke the main window close button on Windows); it watches
+  companion events instead.
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need

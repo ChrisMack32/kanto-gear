@@ -191,6 +191,8 @@ local state = {
   aspectLock = false,
   nativeAspect = false,
   sdlHandlingMax = false,
+  sdlPendingAspect = false,
+  eventWatch = nil,
   frameW = FRAME_W,
   frameH = FRAME_H,
   logicalW = 0,
@@ -462,6 +464,9 @@ local function defineSDL(ffi)
     int SDL_PeepEvents(SDL_Event *events, int numevents, int action, uint32_t minType, uint32_t maxType);
     int SDL_PushEvent(SDL_Event *event);
     uint8_t SDL_EventState(uint32_t type, int state);
+    typedef int (*SDL_EventFilter)(void *userdata, SDL_Event *event);
+    void SDL_AddEventWatch(SDL_EventFilter filter, void *userdata);
+    void SDL_DelEventWatch(SDL_EventFilter filter, void *userdata);
     uint32_t SDL_GetGlobalMouseState(int *x, int *y);
     uint32_t SDL_GetMouseState(int *x, int *y);
     SDL_Window *SDL_GetMouseFocus(void);
@@ -1441,8 +1446,52 @@ end
 -- SDL companion (Windows / macOS; Linux fallback only)
 ------------------------------------------------------------------------
 
+local function uninstallSdlEventWatch()
+  local sdl = state.sdl
+  if sdl and state.eventWatch and sdl.SDL_DelEventWatch then
+    pcall(function() sdl.SDL_DelEventWatch(state.eventWatch, nil) end)
+  end
+  if state.eventWatch then
+    pcall(function() state.eventWatch:free() end)
+  end
+  state.eventWatch = nil
+end
+
+-- Observe companion WINDOWEVENTs without removing anything from LÖVE's shared
+-- SDL queue. PeepEvents(GETEVENT) of host CLOSE was swallowing the main
+-- window title-bar X on Windows.
+local function installSdlEventWatch()
+  local sdl, ffi = state.sdl, state.ffi
+  if not (sdl and ffi and sdl.SDL_AddEventWatch) then return end
+  uninstallSdlEventWatch()
+  local function watch(_userdata, event)
+    if not event or state.windowId == 0 then return 0 end
+    if event.type ~= SDL_WINDOWEVENT then return 0 end
+    if event.window.windowID ~= state.windowId then return 0 end
+    local kind = event.window.event
+    if kind == 14 then
+      state.userClosed = true
+    elseif kind == 8 or kind == 5 or kind == 6 then
+      state.needsRedraw = true
+      state.sdlPendingAspect = true
+    end
+    return 0
+  end
+  local ok, cb = pcall(function()
+    return ffi.cast("int (*)(void *, SDL_Event *)", watch)
+  end)
+  if not ok or cb == nil then
+    warn("SDL_AddEventWatch cast failed: %s", tostring(cb))
+    return
+  end
+  state.eventWatch = cb
+  pcall(function() sdl.SDL_AddEventWatch(cb, nil) end)
+  log("sdl event watch installed for companion window events")
+end
+
 local function destroySdlWindow()
   local sdl = state.sdl
+  uninstallSdlEventWatch()
   if not sdl then
     state.window, state.renderer, state.texture, state.hwnd = nil, nil, nil, nil
     state.windowId = 0
@@ -1459,6 +1508,7 @@ local function destroySdlWindow()
   state.prevButtons = 0
   state.nativeAspect = false
   state.sdlHandlingMax = false
+  state.sdlPendingAspect = false
   state.lastPresentW, state.lastPresentH = 0, 0
   state.needsRedraw = false
 end
@@ -1856,6 +1906,9 @@ local function ensureSdlWindow()
     state.windowId = tonumber(sdl.SDL_GetWindowID(window)) or 0
     state.frameW, state.frameH = FRAME_W, FRAME_H
     state.logicalW, state.logicalH = -1, -1 -- force clearSdlLogicalSize once
+    state.userClosed = false
+    state.sdlPendingAspect = false
+    installSdlEventWatch()
     lockNativeAspect(window)
     enforceAspect()
     clearSdlLogicalSize()
@@ -1879,44 +1932,25 @@ local function mainWindowOpen()
 end
 
 local function drainWindowEvents()
-  local sdl, ffi = state.sdl, state.ffi
-  if not sdl or state.window == nil then return end
+  local sdl = state.sdl
+  if not sdl then return end
 
-  -- Never SDL_PumpEvents here: LÖVE owns the shared SDL event queue on every
-  -- desktop OS. Mid-frame PumpEvents + SysWM peeks hard-crashed Windows hosts.
-  -- Also peep one WINDOWEVENT at a time with the correct 56-byte SDL_Event.
-
-  local ev = ffi.new("SDL_Event")
-  for _ = 1, 32 do
-    local n = sdl.SDL_PeepEvents(ev, 1, SDL_GETEVENT, SDL_WINDOWEVENT, SDL_WINDOWEVENT)
-    if n <= 0 then break end
-    local kind = ev.window.event
-    if ev.window.windowID == state.windowId then
-      if kind == 14 then
-        log("companion window closed by user")
-        state.userClosed = true
-        destroyWindow()
-        enqueueTouch("cancel,0,0")
-        return
-      elseif kind == 8 then
-        -- MAXIMIZED: remap to max 160:144 fit (no red pillarbox bars).
-        state.needsRedraw = true
-        sdlApplyMaxAspectFit()
-      elseif kind == 5 or kind == 6 then
-        -- SIZE_CHANGED / RESIZED: snap aspect and mark for pinned redraw.
-        state.needsRedraw = true
-        enforceAspect()
-      end
-    else
-      if kind == 14 then
-        log("host window closed; closing companion")
-        destroyWindow()
-        sdl.SDL_PushEvent(ev)
-        return
-      end
-      -- Leave host window events for LÖVE.
-      sdl.SDL_PushEvent(ev)
+  -- Do not PeepEvents(GETEVENT) on the shared SDL queue. Removing host
+  -- WINDOWEVENT_CLOSE (even when PushEvent'd back) broke the main window's
+  -- title-bar close button on Windows. Companion close / resize is observed
+  -- via SDL_AddEventWatch; size / maximize are also polled each frame.
+  if state.userClosed then
+    if state.window ~= nil then
+      log("companion window closed by user")
+      destroyWindow()
+      enqueueTouch("cancel,0,0")
     end
+    return
+  end
+  if state.window == nil then return end
+  if state.sdlPendingAspect then
+    state.sdlPendingAspect = false
+    enforceAspect()
   end
 end
 
