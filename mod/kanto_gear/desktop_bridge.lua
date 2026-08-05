@@ -152,7 +152,8 @@ local state = {
   aspectTargetH = 0,
   lastLockedW = 0,
   lastLockedH = 0,
-  xExpanded = false, -- maximized / fullscreen: letterbox only, do not snap
+  xExpanded = false,
+  xHandlingMax = false, -- re-entrancy guard for maximize → max-fit
   pendingAspectSnap = false, -- after unmaximize, keep absolute snapping until locked
   xAtomNetWmState = nil,
   xAtomMaxHorz = nil,
@@ -210,8 +211,13 @@ local X_ZPixmap = 2
 local X_PMinSize = 16
 local X_PAspect = 256
 local X_PBaseSize = 512
+local X_CWX = 1
+local X_CWY = 2
 local X_CWWidth = 4
 local X_CWHeight = 8
+local X_SubstructureNotifyMask = 524288
+local X_SubstructureRedirectMask = 1048576
+local X_NET_WM_STATE_REMOVE = 0
 
 local function breadcrumb(msg)
   pcall(function()
@@ -597,6 +603,10 @@ local function defineX11(ffi)
     int XFree(void *data);
     int XDisplayWidth(Display *display, int screen_number);
     int XDisplayHeight(Display *display, int screen_number);
+    int XMoveResizeWindow(Display *display, Window w, int x, int y,
+      unsigned int width, unsigned int height);
+    int XSendEvent(Display *display, Window w, int propagate, long event_mask,
+      XEvent *event_send);
     XImage *XCreateImage(Display *display, void *visual, unsigned int depth,
       int format, int offset, char *data, unsigned int width, unsigned int height,
       int bitmap_pad, int bytes_per_line);
@@ -833,11 +843,122 @@ local function x11SnapSize(cw, ch, prevW, prevH, absolute)
   return nw, nh
 end
 
-local function x11ApplySize(nw, nh)
+-- Mutual recursion: maximize-fit may fall back to apply-size.
+local x11ApplySize
+local x11ApplyMaxAspectFit
+
+-- Ask the WM to drop maximized / fullscreen so we can apply a real size.
+local function x11ClearExpandedState()
+  local x11, ffi = state.x11, state.ffi
+  if not (x11 and state.xDisplay and state.xWindow and state.xAtomNetWmState) then
+    return
+  end
+  if not x11.XSendEvent then return end
+  local root = x11.XDefaultRootWindow(state.xDisplay)
+  local function remove(atomA, atomB)
+    if not atomA or atomA == 0 then return end
+    local ev = ffi.new("XEvent")
+    ev.type = X_ClientMessage
+    ev.xclient.display = state.xDisplay
+    ev.xclient.window = state.xWindow
+    ev.xclient.message_type = state.xAtomNetWmState
+    ev.xclient.format = 32
+    ev.xclient.data_l[0] = X_NET_WM_STATE_REMOVE
+    ev.xclient.data_l[1] = atomA
+    ev.xclient.data_l[2] = (atomB and atomB ~= 0) and atomB or 0
+    ev.xclient.data_l[3] = 1
+    ev.xclient.data_l[4] = 0
+    x11.XSendEvent(
+      state.xDisplay, root, 0,
+      X_SubstructureNotifyMask + X_SubstructureRedirectMask, ev)
+  end
+  remove(state.xAtomMaxVert, state.xAtomMaxHorz)
+  remove(state.xAtomFullscreen, 0)
+  if x11.XSync then
+    x11.XSync(state.xDisplay, 0)
+  else
+    x11.XFlush(state.xDisplay)
+  end
+end
+
+-- Maximize / fullscreen on a 16:9 monitor would pillarbox the 160:144 frame
+-- (theme filler often reads as red side bars). Turn that into the largest
+-- exact 160:144 window that fits, centered on the screen.
+x11ApplyMaxAspectFit = function()
+  if state.xWindow == nil or not state.x11 then return state.xWinW, state.xWinH end
+  if state.xHandlingMax then return state.xWinW, state.xWinH end
+  state.xHandlingMax = true
+  state.aspectLock = true
+  pcall(x11ClearExpandedState)
+
+  local maxW, maxH = x11UsableMax()
+  local nw, nh
+  if maxW and maxH then
+    nw, nh = Bridge.clampAspectToMax(maxW + 1, maxH + 1, maxW, maxH, FRAME_W, FRAME_H)
+  else
+    nw = FRAME_W * DEFAULT_SCALE
+    nh = FRAME_H * DEFAULT_SCALE
+  end
+
+  local x11, ffi = state.x11, state.ffi
+  local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or nw
+  local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or nh
+  local x = math.max(0, math.floor((sw - nw) / 2))
+  local y = math.max(0, math.floor((sh - nh) / 2))
+  pcall(function()
+    if x11.XMoveResizeWindow then
+      x11.XMoveResizeWindow(state.xDisplay, state.xWindow, x, y, nw, nh)
+    elseif x11.XConfigureWindow then
+      local changes = ffi.new("XWindowChanges")
+      changes.x, changes.y = x, y
+      changes.width, changes.height = nw, nh
+      x11.XConfigureWindow(
+        state.xDisplay, state.xWindow,
+        X_CWX + X_CWY + X_CWWidth + X_CWHeight, changes)
+    else
+      x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
+    end
+    if x11.XSync then
+      x11.XSync(state.xDisplay, 0)
+    else
+      x11.XFlush(state.xDisplay)
+    end
+  end)
+
+  local aw, ah = x11WindowSize()
+  state.xWinW, state.xWinH = aw, ah
+  if aw ~= nw or ah ~= nh then
+    -- WM may have ignored move while still marked maximized; force size.
+    x11ApplySize(nw, nh)
+  else
+    state.lastLockedW, state.lastLockedH = nw, nh
+  end
+  -- Re-center after the size has actually stuck.
+  aw, ah = state.xWinW, state.xWinH
+  if aw == nw and ah == nh then
+    local cx = math.max(0, math.floor((sw - nw) / 2))
+    local cy = math.max(0, math.floor((sh - nh) / 2))
+    pcall(function()
+      if x11.XMoveResizeWindow then
+        x11.XMoveResizeWindow(state.xDisplay, state.xWindow, cx, cy, nw, nh)
+      end
+      if x11.XSync then x11.XSync(state.xDisplay, 0) end
+    end)
+  end
+  state.xExpanded = false
+  state.pendingAspectSnap = false
+  state.needsRedraw = true
+  state.aspectLock = false
+  state.xHandlingMax = false
+  log("maximize remapped to max 160:144 fit %dx%d", nw, nh)
+  return state.xWinW, state.xWinH
+end
+
+x11ApplySize = function(nw, nh)
   local ffi, x11 = state.ffi, state.x11
   if not x11 or state.xWindow == nil then return end
-  if x11IsExpanded(state.xWinW, state.xWinH) then
-    state.xExpanded = true
+  if not state.xHandlingMax and x11IsExpanded(state.xWinW, state.xWinH) then
+    x11ApplyMaxAspectFit()
     return
   end
   local maxW, maxH = x11UsableMax()
@@ -875,14 +996,13 @@ end
 
 -- Snap the OS window onto 160:144. Many WMs ignore PAspect during live
 -- drag; we keep forcing the locked size from the dominant drag axis.
--- Skipped while maximized/fullscreen so letterboxing owns the aspect.
+-- Maximize / fullscreen is remapped to a max-fit 160:144 window.
 local function x11EnforceAspect(force)
   if state.xWindow == nil or not state.x11 then return state.xWinW, state.xWinH end
   if state.aspectLock and not force then return state.xWinW, state.xWinH end
   local cw, ch = x11WindowSize()
   if x11IsExpanded(cw, ch) then
-    state.xExpanded = true
-    return cw, ch
+    return x11ApplyMaxAspectFit()
   end
   local wasExpanded = state.xExpanded
   if wasExpanded then
@@ -914,7 +1034,7 @@ local function x11Blit(imageData)
 
   local vw, vh = x11WindowSize()
   if x11IsExpanded(vw, vh) then
-    state.xExpanded = true
+    vw, vh = x11ApplyMaxAspectFit()
   else
     vw, vh = x11EnforceAspect(true)
   end
@@ -923,11 +1043,9 @@ local function x11Blit(imageData)
 
   local src = state.ffi.cast("const uint8_t *", imageData:getFFIPointer())
   local dst = state.ffi.cast("uint32_t *", state.xPixels)
-  local br = math.floor(state.bg / 0x10000) % 0x100
-  local bgc = math.floor(state.bg / 0x100) % 0x100
-  local bb = state.bg % 0x100
-  -- Little-endian 32bpp TrueColor packed as 0x00RRGGBB → bytes B,G,R,0
-  local bgPixel = bb + bgc * 0x100 + br * 0x10000
+  -- Black gutters if any letterbox remains; theme filler read as "red bars"
+  -- when a 16:9 maximize briefly outran the aspect snap.
+  local bgPixel = 0
   local dx, dy, dw, dh = Bridge.letterbox(vw, vh, fw, fh)
 
   for i = 0, vw * vh - 1 do
@@ -1020,8 +1138,7 @@ local function x11DrainEvents()
   if cfgW and cfgH and state.xWindow ~= nil then
     state.xWinW, state.xWinH = cfgW, cfgH
     if x11IsExpanded(cfgW, cfgH) then
-      state.xExpanded = true
-      -- Keep lastLocked at the pre-maximize size so restore can snap cleanly.
+      x11ApplyMaxAspectFit()
     else
       local wasExpanded = state.xExpanded
       if wasExpanded then
@@ -1045,8 +1162,7 @@ local function x11DrainEvents()
               if not x11IsExpanded(aw, ah) then
                 x11ApplySize(nw, nh)
               else
-                state.xExpanded = true
-                state.xWinW, state.xWinH = aw, ah
+                x11ApplyMaxAspectFit()
               end
             else
               state.xWinW, state.xWinH = aw, ah
@@ -1121,6 +1237,10 @@ local function initX11Backend(ffi)
       } XWindowChanges;
       int XConfigureWindow(Display *display, Window w, unsigned int value_mask,
         XWindowChanges *changes);
+      int XMoveResizeWindow(Display *display, Window w, int x, int y,
+        unsigned int width, unsigned int height);
+      int XSendEvent(Display *display, Window w, int propagate, long event_mask,
+        XEvent *event_send);
     ]]
   end)
   local display = x11.XOpenDisplay(nil)

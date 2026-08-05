@@ -125,8 +125,8 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
   OpenGL context hard-crashes on many Linux setups. Pure Wayland sessions
   without XWayland will not get a companion window; check the game log (and
   `/tmp/kanto-gear-bridge.log`) for `desktop bridge inactive`. Maximized /
-  fullscreen companion windows letterbox the 160∶144 frame instead of forcing
-  a taller-than-screen size.
+  fullscreen on Linux is remapped to the largest 160∶144 window that fits the
+  screen (centered), so a 16:9 maximize does not leave colored side bars.
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need
