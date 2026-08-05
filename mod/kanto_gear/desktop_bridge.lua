@@ -195,6 +195,8 @@ local state = {
   logicalW = 0,
   logicalH = 0,
   pinImage = nil,
+  lastPresentW = 0,
+  lastPresentH = 0,
   log = nil,
 }
 
@@ -1447,6 +1449,8 @@ local function destroySdlWindow()
   state.pointerDown = false
   state.prevButtons = 0
   state.nativeAspect = false
+  state.lastPresentW, state.lastPresentH = 0, 0
+  state.needsRedraw = false
 end
 
 local function destroyWindow()
@@ -1626,6 +1630,43 @@ local function enforceAspect()
     sdl.SDL_SetWindowSize(state.window, nw, nh)
   end)
   state.aspectLock = false
+  -- Client area changed; re-blit pinned frame on the next poll/present.
+  state.needsRedraw = true
+end
+
+-- Re-letterbox the last frame into the current window size without waiting for
+-- a new dirty present from main.lua (resize otherwise leaves black gutters).
+local function presentSdlPinned()
+  if state.backend ~= "sdl" then return false end
+  if state.window == nil or state.renderer == nil or state.texture == nil then
+    return false
+  end
+  if state.pinImage == nil or state.frameW < 1 or state.frameH < 1 then
+    return false
+  end
+
+  local ok, err = pcall(function()
+    withHostGL(function()
+      local r = math.floor(state.bg / 0x10000) % 0x100
+      local g = math.floor(state.bg / 0x100) % 0x100
+      local b = state.bg % 0x100
+      clearSdlLogicalSize()
+      state.sdl.SDL_SetRenderDrawColor(state.renderer, r, g, b, 255)
+      state.sdl.SDL_RenderClear(state.renderer)
+      local dx, dy, dw, dh = presentDestRect(state.frameW, state.frameH)
+      local dest = state.ffi.new("SDL_Rect", { x = dx, y = dy, w = dw, h = dh })
+      state.sdl.SDL_RenderCopy(state.renderer, state.texture, nil, dest)
+      state.sdl.SDL_RenderPresent(state.renderer)
+    end)
+  end)
+  if not ok then
+    warn("companion pinned present error: %s", tostring(err))
+    return false
+  end
+  local vw, vh = windowSize()
+  state.lastPresentW, state.lastPresentH = vw, vh
+  state.needsRedraw = false
+  return true
 end
 
 local function createCompanionRenderer(sdl, window)
@@ -1742,6 +1783,8 @@ local function drainWindowEvents()
         enqueueTouch("cancel,0,0")
         return
       elseif kind == 5 or kind == 6 then
+        -- SIZE_CHANGED / RESIZED: snap aspect and mark for pinned redraw.
+        state.needsRedraw = true
         enforceAspect()
       end
     else
@@ -1869,6 +1912,11 @@ local function presentSdl(imageData, backgroundColor)
 
   pcall(drainWindowEvents)
   if state.window ~= nil then pcall(enforceAspect) end
+  if state.window ~= nil then
+    local vw, vh = windowSize()
+    state.lastPresentW, state.lastPresentH = vw, vh
+    state.needsRedraw = false
+  end
   return state.window ~= nil
 end
 
@@ -1934,6 +1982,14 @@ local function pollSecondaryDisplayTouch()
     drainWindowEvents()
     if state.window ~= nil then
       enforceAspect()
+      local vw, vh = windowSize()
+      if state.needsRedraw
+          or vw ~= state.lastPresentW
+          or vh ~= state.lastPresentH then
+        if state.pinImage ~= nil then
+          pcall(presentSdlPinned)
+        end
+      end
       pollMouse()
     end
   end
