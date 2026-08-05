@@ -108,6 +108,29 @@ function Bridge.logicalPoint(x, y, vw, vh, fw, fh)
   return lx, ly
 end
 
+-- Map a window-point letterbox rect into renderer output pixels (Retina/HiDPI).
+-- When outW/outH match vw/vh this is a no-op. Mouse hit-testing stays in points.
+function Bridge.scaleToOutput(dx, dy, dw, dh, vw, vh, outW, outH)
+  vw = math.max(1, math.floor(tonumber(vw) or 1))
+  vh = math.max(1, math.floor(tonumber(vh) or 1))
+  outW = math.max(1, math.floor(tonumber(outW) or vw))
+  outH = math.max(1, math.floor(tonumber(outH) or vh))
+  dx = math.floor(tonumber(dx) or 0)
+  dy = math.floor(tonumber(dy) or 0)
+  dw = math.max(1, math.floor(tonumber(dw) or 1))
+  dh = math.max(1, math.floor(tonumber(dh) or 1))
+  if outW == vw and outH == vh then
+    return dx, dy, dw, dh, 1, 1
+  end
+  local sx = outW / vw
+  local sy = outH / vh
+  return math.floor(dx * sx + 0.5),
+    math.floor(dy * sy + 0.5),
+    math.max(1, math.floor(dw * sx + 0.5)),
+    math.max(1, math.floor(dh * sy + 0.5)),
+    sx, sy
+end
+
 function Bridge.rgb24ToFloat(color)
   color = color or 0
   local r = math.floor(color / 0x10000) % 0x100
@@ -169,6 +192,8 @@ local state = {
   nativeAspect = false,
   frameW = FRAME_W,
   frameH = FRAME_H,
+  logicalW = 0,
+  logicalH = 0,
   pinImage = nil,
   log = nil,
 }
@@ -408,6 +433,8 @@ local function defineSDL(ffi)
     int SDL_RenderClear(SDL_Renderer *renderer);
     int SDL_RenderCopy(SDL_Renderer *renderer, SDL_Texture *texture, const void *srcrect, const void *dstrect);
     void SDL_RenderPresent(SDL_Renderer *renderer);
+    int SDL_RenderSetLogicalSize(SDL_Renderer *renderer, int w, int h);
+    int SDL_GetRendererOutputSize(SDL_Renderer *renderer, int *w, int *h);
 
     SDL_Texture *SDL_CreateTexture(SDL_Renderer *renderer, uint32_t format, int access, int w, int h);
     void SDL_DestroyTexture(SDL_Texture *texture);
@@ -1561,6 +1588,44 @@ local function windowSize()
   return tonumber(w[0]), tonumber(h[0])
 end
 
+-- Disable SDL logical scaling. We letterbox in window points, then scale the
+-- dest rect into renderer pixels ourselves. Logical size would fight that
+-- (and can get lost across host GL context save/restore on macOS).
+local function clearSdlLogicalSize()
+  local sdl = state.sdl
+  if not (sdl and state.renderer) then return end
+  if state.logicalW == 0 and state.logicalH == 0 then return end
+  if sdl.SDL_RenderSetLogicalSize then
+    pcall(function() sdl.SDL_RenderSetLogicalSize(state.renderer, 0, 0) end)
+  end
+  state.logicalW, state.logicalH = 0, 0
+end
+
+-- Pixel size of the renderer backbuffer (may exceed windowSize on HiDPI).
+local function rendererOutputSize()
+  local sdl, ffi = state.sdl, state.ffi
+  if sdl and state.renderer and sdl.SDL_GetRendererOutputSize then
+    local w = ffi.new("int[1]")
+    local h = ffi.new("int[1]")
+    local ok = pcall(function()
+      return sdl.SDL_GetRendererOutputSize(state.renderer, w, h)
+    end)
+    if ok and tonumber(w[0]) and tonumber(w[0]) > 0 and tonumber(h[0]) and tonumber(h[0]) > 0 then
+      return tonumber(w[0]), tonumber(h[0])
+    end
+  end
+  return windowSize()
+end
+
+-- Letterbox dest in renderer pixels (fills Retina drawables; no-op at 1× DPI).
+local function presentDestRect(fw, fh)
+  local vw, vh = windowSize()
+  local outW, outH = rendererOutputSize()
+  local dx, dy, dw, dh = Bridge.letterbox(vw, vh, fw, fh)
+  dx, dy, dw, dh = Bridge.scaleToOutput(dx, dy, dw, dh, vw, vh, outW, outH)
+  return dx, dy, dw, dh, vw, vh, outW, outH
+end
+
 local function enforceAspect()
   local sdl = state.sdl
   if not sdl or state.window == nil or state.aspectLock then return end
@@ -1632,10 +1697,15 @@ local function ensureSdlWindow()
     state.texture = texture
     state.windowId = tonumber(sdl.SDL_GetWindowID(window)) or 0
     state.frameW, state.frameH = FRAME_W, FRAME_H
+    state.logicalW, state.logicalH = -1, -1 -- force clearSdlLogicalSize once
     lockNativeAspect(window)
     enforceAspect()
-    log("sdl companion window opened id=%s nativeAspect=%s rendererFlags=%s",
-      tostring(state.windowId), tostring(state.nativeAspect), tostring(rflags))
+    clearSdlLogicalSize()
+    local outW, outH = rendererOutputSize()
+    local winW, winH = windowSize()
+    log("sdl companion window opened id=%s nativeAspect=%s rendererFlags=%s window=%sx%s output=%sx%s",
+      tostring(state.windowId), tostring(state.nativeAspect), tostring(rflags),
+      tostring(winW), tostring(winH), tostring(outW), tostring(outH))
     return true
   end)
 end
@@ -1804,11 +1874,13 @@ local function presentSdl(imageData, backgroundColor)
       local r = math.floor(state.bg / 0x10000) % 0x100
       local g = math.floor(state.bg / 0x100) % 0x100
       local b = state.bg % 0x100
+      -- Draw in renderer pixel space so Retina/HiDPI macOS fills the window
+      -- (windowSize is points; output size is often 2×). Mouse stays in points.
+      clearSdlLogicalSize()
       state.sdl.SDL_SetRenderDrawColor(state.renderer, r, g, b, 255)
       state.sdl.SDL_RenderClear(state.renderer)
 
-      local vw, vh = windowSize()
-      local dx, dy, dw, dh = Bridge.letterbox(vw, vh, state.frameW, state.frameH)
+      local dx, dy, dw, dh = presentDestRect(state.frameW, state.frameH)
       local dest = state.ffi.new("SDL_Rect", { x = dx, y = dy, w = dw, h = dh })
       state.sdl.SDL_RenderCopy(state.renderer, state.texture, nil, dest)
       state.sdl.SDL_RenderPresent(state.renderer)
