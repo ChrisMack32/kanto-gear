@@ -119,11 +119,12 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
 
 ## Known limits
 
-- Desktop needs LuaJIT FFI plus the SDL2 library already shipped with
-  Gen1Recomp. The bridge prefers the SDL2 already loaded by the host (important
-  on Linux AppImages) and uses a software renderer for the companion on Linux
-  so it does not fight the main OpenGL context. If the companion window cannot
-  open, check the game log for `desktop bridge inactive`.
+- Desktop needs LuaJIT FFI. On Windows/macOS the companion is a second SDL2
+  window (using the SDL2 already shipped with Gen1Recomp). On Linux it uses a
+  separate **X11** window instead, because a second SDL window next to LÖVE's
+  OpenGL context hard-crashes on many Linux setups. Pure Wayland sessions
+  without XWayland will not get a companion window; check the game log (and
+  `/tmp/kanto-gear-bridge.log`) for `desktop bridge inactive`.
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need

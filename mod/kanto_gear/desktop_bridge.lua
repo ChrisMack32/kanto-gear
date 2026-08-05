@@ -1,8 +1,11 @@
 -- Desktop secondary-display bridge for stock Gen1Recomp (Windows / macOS /
 -- Linux). Polyfills the Android love.system secondary-display API with a
--- second SDL2 window. Aspect ratio is locked to 160:144 using native OS
--- hooks where possible (Cocoa / Win32) plus a per-frame fallback, because
--- LÖVE's event pump consumes SDL resize events before mods can see them.
+-- second window.
+--
+-- Windows / macOS: second SDL2 window (native aspect hooks + GL context
+-- restore so LÖVE keeps its MakeCurrent state).
+-- Linux: pure X11 companion window. A second SDL window next to LÖVE's GL
+-- context hard-crashes on many Linux setups even with a software renderer.
 
 local Bridge = {}
 
@@ -11,13 +14,12 @@ local DEFAULT_SCALE = 3
 local MAX_TOUCHES = 64
 local FRAME_W, FRAME_H = WIDTH, HEIGHT
 local ASPECT = FRAME_W / FRAME_H -- 10/9
+local DEBUG_LOG = "/tmp/kanto-gear-bridge.log"
 
 ------------------------------------------------------------------------
 -- Pure helpers (also used by unit tests)
 ------------------------------------------------------------------------
 
--- Fit the GB frame inside the window, preserving aspect (nearest-neighbour
--- friendly continuous scale so a correctly-proportioned window fills).
 function Bridge.letterbox(vw, vh, fw, fh)
   fw = fw or FRAME_W
   fh = fh or FRAME_H
@@ -32,8 +34,6 @@ function Bridge.letterbox(vw, vh, fw, fh)
   return dx, dy, dw, dh, scale
 end
 
--- Force a proposed window size onto the 160:144 aspect. Width-dominant when
--- the window is too wide; height-dominant when too tall.
 function Bridge.constrainAspect(w, h, fw, fh)
   fw = fw or FRAME_W
   fh = fh or FRAME_H
@@ -46,7 +46,6 @@ function Bridge.constrainAspect(w, h, fw, fh)
     h = math.max(fh, h)
     w = math.max(fw, math.floor(h * fw / fh + 0.5))
   end
-  -- Final exact snap from width so floating error cannot drift the ratio.
   h = math.max(fh, math.floor(w * fh / fw + 0.5))
   return w, h, w / fw
 end
@@ -71,21 +70,129 @@ function Bridge.rgb24ToFloat(color)
 end
 
 ------------------------------------------------------------------------
+-- Runtime state
+------------------------------------------------------------------------
+
+local state = {
+  installed = false,
+  usable = false,
+  reason = nil,
+  backend = nil, -- "x11" | "sdl"
+  ffi = nil,
+  sdl = nil,
+  x11 = nil,
+  window = nil,
+  renderer = nil,
+  texture = nil,
+  windowId = 0,
+  hwnd = nil,
+  -- X11
+  xDisplay = nil,
+  xWindow = nil,
+  xScreen = 0,
+  xGc = nil,
+  xVisual = nil,
+  xDepth = 24,
+  xImage = nil,
+  xPixels = nil,
+  xPixW = 0,
+  xPixH = 0,
+  xWmDelete = nil,
+  xWinW = 0,
+  xWinH = 0,
+  bg = 0x0F380F,
+  touches = {},
+  prevButtons = 0,
+  pointerDown = false,
+  userClosed = false,
+  aspectLock = false,
+  nativeAspect = false,
+  frameW = FRAME_W,
+  frameH = FRAME_H,
+  pinImage = nil,
+  log = nil,
+}
+
+local SDL_WINDOWPOS_CENTERED = 0x2FFF0000
+local SDL_WINDOW_RESIZABLE = 0x00000020
+local SDL_WINDOW_ALLOW_HIGHDPI = 0x00002000
+local SDL_RENDERER_SOFTWARE = 0x00000001
+local SDL_RENDERER_ACCELERATED = 0x00000002
+local SDL_RENDERER_PRESENTVSYNC = 0x00000004
+local SDL_PIXELFORMAT_RGBA32 = 0x16762004
+local SDL_TEXTUREACCESS_STREAMING = 1
+local SDL_ScaleModeNearest = 0
+local SDL_WINDOWEVENT = 0x200
+local SDL_SYSWMEVENT = 0x201
+local SDL_GETEVENT = 2
+local SDL_ENABLE = 1
+local WM_SIZING = 0x0214
+local WMSZ_LEFT = 1
+local WMSZ_RIGHT = 2
+local WMSZ_TOP = 3
+local WMSZ_TOPLEFT = 4
+local WMSZ_TOPRIGHT = 5
+local WMSZ_BOTTOM = 6
+local WMSZ_BOTTOMLEFT = 7
+local WMSZ_BOTTOMRIGHT = 8
+
+-- X11 event / input masks
+local X_KeyPressMask = 1
+local X_ButtonPressMask = 4
+local X_ButtonReleaseMask = 8
+local X_ExposureMask = 32768
+local X_StructureNotifyMask = 131072
+local X_ClientMessage = 33
+local X_DestroyNotify = 17
+local X_ConfigureNotify = 22
+local X_ButtonPress = 4
+local X_ButtonRelease = 5
+local X_ZPixmap = 2
+local X_PMinSize = 16
+local X_PAspect = 256
+
+local function breadcrumb(msg)
+  pcall(function()
+    local f = io.open(DEBUG_LOG, "a")
+    if not f then return end
+    f:write(os.date("!%Y-%m-%dT%H:%M:%SZ "), tostring(msg), "\n")
+    f:close()
+  end)
+end
+
+local function log(fmt, ...)
+  local msg = string.format(fmt, ...)
+  breadcrumb(msg)
+  if state.log then state.log:info("%s", msg) end
+end
+
+local function warn(fmt, ...)
+  local msg = string.format(fmt, ...)
+  breadcrumb("WARN " .. msg)
+  if state.log then state.log:warn("%s", msg) end
+end
+
+local function enqueueTouch(event)
+  if #state.touches >= MAX_TOUCHES then
+    state.touches = { "cancel,0,0" }
+  end
+  state.touches[#state.touches + 1] = event
+end
+
+local function wantsNativeWMInfo(ffi)
+  return ffi.os == "OSX" or ffi.os == "Windows"
+end
+
+------------------------------------------------------------------------
 -- SDL loader
 ------------------------------------------------------------------------
 
--- Prefer the SDL2 already mapped into this process (LÖVE / Gen1Recomp).
--- Loading a second, different libSDL2.so on Linux (system vs AppImage)
--- creates a parallel SDL instance and hard-crashes shortly after window
--- create / present.
 local function findMappedSDL(ffi)
   if ffi.os == "Windows" then return nil end
-  local mapsPath = "/proc/self/maps"
-  local f = io.open(mapsPath, "r")
+  local f = io.open("/proc/self/maps", "r")
   if not f then return nil end
   local best, bestScore = nil, -1
   for line in f:lines() do
-    -- pathname is the last whitespace-separated field when present
     local path = line:match("%s(/[^%s]+)$")
     if path and path:find("libSDL2", 1, true) and path:find("%.so", 1, true)
         and not path:find("libSDL2_image", 1, true)
@@ -112,9 +219,7 @@ end
 local function tryLoadSDL(ffi)
   local names = {}
   local mapped = findMappedSDL(ffi)
-  if mapped then
-    names[#names + 1] = mapped
-  end
+  if mapped then names[#names + 1] = mapped end
   if ffi.os == "Windows" then
     names[#names + 1] = "SDL2"
     names[#names + 1] = "SDL2.dll"
@@ -172,6 +277,7 @@ local function defineSDL(ffi)
     typedef struct SDL_Window SDL_Window;
     typedef struct SDL_Renderer SDL_Renderer;
     typedef struct SDL_Texture SDL_Texture;
+    typedef void *SDL_GLContext;
 
     typedef struct SDL_WindowEvent {
       uint32_t type;
@@ -204,7 +310,6 @@ local function defineSDL(ffi)
       uint8_t patch;
     } SDL_version;
 
-    /* Enough of SDL_SysWMinfo for cocoa.window / win.window (first union ptr). */
     typedef struct SDL_SysWMinfo {
       SDL_version version;
       uint8_t _pad;
@@ -240,6 +345,10 @@ local function defineSDL(ffi)
     int SDL_UpdateTexture(SDL_Texture *texture, const void *rect, const void *pixels, int pitch);
     int SDL_SetTextureScaleMode(SDL_Texture *texture, int scaleMode);
 
+    SDL_Window *SDL_GL_GetCurrentWindow(void);
+    SDL_GLContext SDL_GL_GetCurrentContext(void);
+    int SDL_GL_MakeCurrent(SDL_Window *window, SDL_GLContext context);
+
     void SDL_PumpEvents(void);
     int SDL_PeepEvents(SDL_Event *events, int numevents, int action, uint32_t minType, uint32_t maxType);
     int SDL_PushEvent(SDL_Event *event);
@@ -251,95 +360,483 @@ local function defineSDL(ffi)
   ]]
 end
 
-------------------------------------------------------------------------
--- Runtime state
-------------------------------------------------------------------------
-
-local state = {
-  installed = false,
-  usable = false,
-  reason = nil,
-  ffi = nil,
-  sdl = nil,
-  window = nil,
-  renderer = nil,
-  texture = nil,
-  windowId = 0,
-  hwnd = nil,
-  bg = 0x0F380F,
-  touches = {},
-  prevButtons = 0,
-  pointerDown = false,
-  userClosed = false,
-  aspectLock = false,
-  nativeAspect = false,
-  frameW = FRAME_W,
-  frameH = FRAME_H,
-  log = nil,
-}
-
-local SDL_WINDOWPOS_CENTERED = 0x2FFF0000
-local SDL_WINDOW_RESIZABLE = 0x00000020
-local SDL_WINDOW_ALLOW_HIGHDPI = 0x00002000
-local SDL_RENDERER_SOFTWARE = 0x00000001
-local SDL_RENDERER_ACCELERATED = 0x00000002
-local SDL_RENDERER_PRESENTVSYNC = 0x00000004
-local SDL_PIXELFORMAT_RGBA32 = 0x16762004
-local SDL_TEXTUREACCESS_STREAMING = 1
-local SDL_ScaleModeNearest = 0
-local SDL_WINDOWEVENT = 0x200
-local SDL_SYSWMEVENT = 0x201
-local SDL_GETEVENT = 2
-local SDL_ENABLE = 1
-local WM_SIZING = 0x0214
-local WMSZ_LEFT = 1
-local WMSZ_RIGHT = 2
-local WMSZ_TOP = 3
-local WMSZ_TOPLEFT = 4
-local WMSZ_TOPRIGHT = 5
-local WMSZ_BOTTOM = 6
-local WMSZ_BOTTOMLEFT = 7
-local WMSZ_BOTTOMRIGHT = 8
-
--- Linux/X11 SysWMinfo layout differs enough that an incomplete FFI cdef
--- writing through SDL_GetWindowWMInfo can corrupt the heap. Only call it
--- on platforms where we actually need the native handle.
-local function wantsNativeWMInfo(ffi)
-  return ffi.os == "OSX" or ffi.os == "Windows"
-end
-
--- A second accelerated GL/Vulkan SDL_Renderer fights LÖVE's GL context on
--- Linux (especially Wayland / some NVIDIA drivers). Software is slower but
--- process-safe for a tiny 160×144 companion blit.
-local function preferSoftwareRenderer(ffi)
-  return ffi.os ~= "OSX" and ffi.os ~= "Windows"
-end
-
-local function log(fmt, ...)
-  if state.log then state.log:info(fmt, ...) end
-end
-
-local function warn(fmt, ...)
-  if state.log then state.log:warn(fmt, ...) end
-end
-
-local function enqueueTouch(event)
-  if #state.touches >= MAX_TOUCHES then
-    state.touches = { "cancel,0,0" }
+-- Run fn while preserving LÖVE's current OpenGL context. Creating / presenting
+-- a second SDL window can steal MakeCurrent on Linux and crash the host.
+local function withHostGL(fn)
+  local sdl = state.sdl
+  local win, ctx
+  if sdl and sdl.SDL_GL_GetCurrentWindow and sdl.SDL_GL_GetCurrentContext then
+    win = sdl.SDL_GL_GetCurrentWindow()
+    ctx = sdl.SDL_GL_GetCurrentContext()
   end
-  state.touches[#state.touches + 1] = event
+  local ok, a, b, c = pcall(fn)
+  if sdl and win ~= nil and ctx ~= nil and sdl.SDL_GL_MakeCurrent then
+    pcall(function() sdl.SDL_GL_MakeCurrent(win, ctx) end)
+  end
+  if not ok then error(a) end
+  return a, b, c
 end
 
-local function destroyWindow()
+------------------------------------------------------------------------
+-- X11 Linux companion (avoids a second SDL window entirely)
+------------------------------------------------------------------------
+
+local function defineX11(ffi)
+  ffi.cdef[[
+    typedef struct _XDisplay Display;
+    typedef unsigned long XID;
+    typedef XID Window;
+    typedef XID Drawable;
+    typedef XID Colormap;
+    typedef XID Atom;
+    typedef XID Time;
+    typedef unsigned long VisualID;
+    typedef int BoolStatus;
+    typedef struct { int x, y; } XPointPair;
+
+    typedef struct {
+      XID visualid;
+      int _pad_class;
+      unsigned long red_mask, green_mask, blue_mask;
+      int bits_per_rgb, map_entries;
+    } VisualLite;
+
+    typedef struct {
+      long flags;
+      int x, y;
+      int width, height;
+      int min_width, min_height;
+      int max_width, max_height;
+      int width_inc, height_inc;
+      XPointPair min_aspect;
+      XPointPair max_aspect;
+      int base_width, base_height;
+      int win_gravity;
+    } XSizeHints;
+
+    typedef struct {
+      int type;
+      unsigned long serial;
+      int send_event;
+      Display *display;
+      Window window;
+      Window root;
+      Window subwindow;
+      Time time;
+      int x, y;
+      int x_root, y_root;
+      unsigned int state;
+      unsigned int button;
+      int same_screen;
+    } XButtonEvent;
+
+    typedef struct {
+      int type;
+      unsigned long serial;
+      int send_event;
+      Display *display;
+      Window event;
+      Window window;
+      int x, y;
+      int width, height;
+      int border_width;
+      Window above;
+      int override_redirect;
+    } XConfigureEvent;
+
+    typedef struct {
+      int type;
+      unsigned long serial;
+      int send_event;
+      Display *display;
+      Window window;
+      Atom message_type;
+      int format;
+      long data_l[5];
+    } XClientMessageEvent;
+
+    typedef union {
+      int type;
+      XButtonEvent xbutton;
+      XConfigureEvent xconfigure;
+      XClientMessageEvent xclient;
+      char pad[192];
+    } XEvent;
+
+    typedef struct _XImage XImage;
+    struct _XImage {
+      int width, height;
+      int xoffset;
+      int format;
+      char *data;
+      int byte_order;
+      int bitmap_unit;
+      int bitmap_bit_order;
+      int bitmap_pad;
+      int depth;
+      int bytes_per_line;
+      int bits_per_pixel;
+      unsigned long red_mask;
+      unsigned long green_mask;
+      unsigned long blue_mask;
+      void *obdata;
+      struct {
+        void *create_image;
+        int (*destroy_image)(XImage *image);
+        void *get_pixel;
+        void *put_pixel;
+        void *sub_image;
+        void *add_pixel;
+      } f;
+    };
+
+    int XInitThreads(void);
+    Display *XOpenDisplay(const char *name);
+    int XCloseDisplay(Display *display);
+    int XDefaultScreen(Display *display);
+    Window XDefaultRootWindow(Display *display);
+    void *XDefaultVisual(Display *display, int screen);
+    int XDefaultDepth(Display *display, int screen);
+    unsigned long XBlackPixel(Display *display, int screen);
+    unsigned long XWhitePixel(Display *display, int screen);
+    void *XDefaultGC(Display *display, int screen);
+    Window XCreateSimpleWindow(Display *display, Window parent,
+      int x, int y, unsigned int width, unsigned int height,
+      unsigned int border_width, unsigned long border, unsigned long background);
+    int XMapRaised(Display *display, Window w);
+    int XStoreName(Display *display, Window w, const char *name);
+    int XSelectInput(Display *display, Window w, long event_mask);
+    int XPending(Display *display);
+    int XNextEvent(Display *display, XEvent *event_return);
+    int XFlush(Display *display);
+    int XDestroyWindow(Display *display, Window w);
+    int XResizeWindow(Display *display, Window w, unsigned int width, unsigned int height);
+    int XGetGeometry(Display *display, Drawable d, Window *root,
+      int *x, int *y, unsigned int *width, unsigned int *height,
+      unsigned int *border_width, unsigned int *depth);
+    Atom XInternAtom(Display *display, const char *atom_name, int only_if_exists);
+    int XSetWMProtocols(Display *display, Window w, Atom *protocols, int count);
+    void XSetWMNormalHints(Display *display, Window w, XSizeHints *hints);
+    XImage *XCreateImage(Display *display, void *visual, unsigned int depth,
+      int format, int offset, char *data, unsigned int width, unsigned int height,
+      int bitmap_pad, int bytes_per_line);
+    int XPutImage(Display *display, Drawable d, void *gc, XImage *image,
+      int src_x, int src_y, int dest_x, int dest_y,
+      unsigned int width, unsigned int height);
+  ]]
+end
+
+local function tryLoadX11(ffi)
+  local names = {
+    "X11", "libX11.so.6", "libX11.so",
+    "/usr/lib/x86_64-linux-gnu/libX11.so.6",
+    "/usr/lib64/libX11.so.6",
+    "/usr/lib/libX11.so.6",
+  }
+  local mapped
+  local f = io.open("/proc/self/maps", "r")
+  if f then
+    for line in f:lines() do
+      local path = line:match("%s(/[^%s]*libX11%.so[^%s]*)")
+      if path then mapped = path; break end
+    end
+    f:close()
+  end
+  if mapped then table.insert(names, 1, mapped) end
+  for _, name in ipairs(names) do
+    local ok, lib = pcall(ffi.load, name)
+    if ok and lib then return lib, name end
+  end
+  return nil, nil
+end
+
+local function x11DestroyImage()
+  local img = state.xImage
+  if img == nil then return end
+  -- Detach our Lua-owned buffer so destroy_image does not free it twice.
+  img.data = nil
+  if img.f.destroy_image ~= nil then
+    pcall(function() img.f.destroy_image(img) end)
+  end
+  state.xImage, state.xPixels = nil, nil
+  state.xPixW, state.xPixH = 0, 0
+end
+
+local function x11DestroyWindow()
+  local x11 = state.x11
+  local display = state.xDisplay
+  local win = state.xWindow
+  state.xWindow = nil
+  state.xWinW, state.xWinH = 0, 0
+  state.pointerDown = false
+  state.prevButtons = 0
+  x11DestroyImage()
+  if x11 and display ~= nil and win ~= nil then
+    pcall(function() x11.XDestroyWindow(display, win) end)
+    pcall(function() x11.XFlush(display) end)
+  end
+end
+
+local function x11CloseDisplay()
+  x11DestroyWindow()
+  if state.x11 and state.xDisplay ~= nil then
+    pcall(function() state.x11.XCloseDisplay(state.xDisplay) end)
+  end
+  state.xDisplay, state.xGc, state.xVisual, state.xWmDelete = nil, nil, nil, nil
+end
+
+local function x11EnsureImage(vw, vh)
+  local ffi, x11 = state.ffi, state.x11
+  if state.xImage ~= nil and state.xPixW == vw and state.xPixH == vh then
+    return true
+  end
+  x11DestroyImage()
+  local nbytes = vw * vh * 4
+  local pixels = ffi.new("char[?]", nbytes)
+  local image = x11.XCreateImage(
+    state.xDisplay, state.xVisual, state.xDepth,
+    X_ZPixmap, 0, pixels, vw, vh, 32, vw * 4)
+  if image == nil then
+    warn("XCreateImage failed")
+    return false
+  end
+  state.xImage = image
+  state.xPixels = pixels
+  state.xPixW, state.xPixH = vw, vh
+  return true
+end
+
+local function x11EnsureWindow()
+  if state.xWindow ~= nil then return true end
+  if not state.usable or state.backend ~= "x11" or not state.x11 then return false end
+  if state.userClosed then return false end
+  if state.xDisplay == nil then return false end
+
+  local x11 = state.x11
+  local w = FRAME_W * DEFAULT_SCALE
+  local h = FRAME_H * DEFAULT_SCALE
+  local root = x11.XDefaultRootWindow(state.xDisplay)
+  local win = x11.XCreateSimpleWindow(
+    state.xDisplay, root,
+    64, 64, w, h, 1,
+    x11.XBlackPixel(state.xDisplay, state.xScreen),
+    x11.XBlackPixel(state.xDisplay, state.xScreen))
+  if win == nil or win == 0 then
+    warn("XCreateSimpleWindow failed")
+    return false
+  end
+
+  x11.XStoreName(state.xDisplay, win, "Kanto Gear")
+  local mask = X_ButtonPressMask + X_ButtonReleaseMask
+      + X_ExposureMask + X_StructureNotifyMask
+  x11.XSelectInput(state.xDisplay, win, mask)
+
+  local protocols = state.ffi.new("Atom[1]")
+  protocols[0] = state.xWmDelete
+  x11.XSetWMProtocols(state.xDisplay, win, protocols, 1)
+
+  local hints = state.ffi.new("XSizeHints")
+  hints.flags = X_PMinSize + X_PAspect
+  hints.min_width, hints.min_height = FRAME_W, FRAME_H
+  hints.min_aspect.x, hints.min_aspect.y = FRAME_W, FRAME_H
+  hints.max_aspect.x, hints.max_aspect.y = FRAME_W, FRAME_H
+  x11.XSetWMNormalHints(state.xDisplay, win, hints)
+
+  x11.XMapRaised(state.xDisplay, win)
+  x11.XFlush(state.xDisplay)
+
+  state.xWindow = win
+  state.xWinW, state.xWinH = w, h
+  state.frameW, state.frameH = FRAME_W, FRAME_H
+  state.nativeAspect = true
+  log("x11 companion window opened %dx%d", w, h)
+  return true
+end
+
+local function x11WindowSize()
+  if state.xWindow == nil then return state.xWinW, state.xWinH end
+  local ffi, x11 = state.ffi, state.x11
+  local root = ffi.new("Window[1]")
+  local x = ffi.new("int[1]")
+  local y = ffi.new("int[1]")
+  local w = ffi.new("unsigned int[1]")
+  local h = ffi.new("unsigned int[1]")
+  local bw = ffi.new("unsigned int[1]")
+  local depth = ffi.new("unsigned int[1]")
+  local ok = pcall(function()
+    x11.XGetGeometry(state.xDisplay, state.xWindow, root, x, y, w, h, bw, depth)
+  end)
+  if ok then
+    state.xWinW = tonumber(w[0]) or state.xWinW
+    state.xWinH = tonumber(h[0]) or state.xWinH
+  end
+  return state.xWinW, state.xWinH
+end
+
+local function x11DrainEvents()
+  local ffi, x11 = state.ffi, state.x11
+  if not x11 or state.xDisplay == nil or state.xWindow == nil then return end
+  local ev = ffi.new("XEvent")
+  while x11.XPending(state.xDisplay) > 0 do
+    x11.XNextEvent(state.xDisplay, ev)
+    local t = ev.type
+    if t == X_ClientMessage then
+      if ev.xclient.window == state.xWindow then
+        local atom = tonumber(ffi.cast("unsigned long", ev.xclient.data_l[0]))
+        local del = tonumber(ffi.cast("unsigned long", state.xWmDelete))
+        if atom ~= nil and atom == del then
+          log("x11 companion closed by user")
+          state.userClosed = true
+          x11DestroyWindow()
+          enqueueTouch("cancel,0,0")
+          return
+        end
+      end
+    elseif t == X_DestroyNotify then
+      if state.xWindow ~= nil then
+        state.userClosed = true
+        x11DestroyWindow()
+        enqueueTouch("cancel,0,0")
+        return
+      end
+    elseif t == X_ConfigureNotify then
+      if ev.xconfigure.window == state.xWindow then
+        local cw = tonumber(ev.xconfigure.width) or state.xWinW
+        local ch = tonumber(ev.xconfigure.height) or state.xWinH
+        local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
+        state.xWinW, state.xWinH = cw, ch
+        if not state.aspectLock and (nw ~= cw or nh ~= ch) then
+          state.aspectLock = true
+          x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
+          state.xWinW, state.xWinH = nw, nh
+          state.aspectLock = false
+        end
+      end
+    elseif t == X_ButtonPress or t == X_ButtonRelease then
+      if ev.xbutton.window == state.xWindow and ev.xbutton.button == 1 then
+        local vw, vh = x11WindowSize()
+        local x = tonumber(ev.xbutton.x) or 0
+        local y = tonumber(ev.xbutton.y) or 0
+        local lx, ly = Bridge.logicalPoint(x, y, vw, vh, state.frameW, state.frameH)
+        if t == X_ButtonPress then
+          if lx then
+            state.pointerDown = true
+            enqueueTouch(string.format("down,%d,%d", lx, ly))
+          end
+        else
+          if state.pointerDown then
+            if not lx then
+              lx = math.min(state.frameW - 1, math.max(0, math.floor(x * state.frameW / math.max(1, vw))))
+              ly = math.min(state.frameH - 1, math.max(0, math.floor(y * state.frameH / math.max(1, vh))))
+            end
+            state.pointerDown = false
+            enqueueTouch(string.format("up,%d,%d", lx, ly))
+          end
+        end
+      end
+    end
+  end
+end
+
+local function x11Present(imageData, backgroundColor)
+  if not x11EnsureWindow() then return false end
+  state.bg = backgroundColor or state.bg
+  state.pinImage = imageData
+
+  local fw = imageData:getWidth()
+  local fh = imageData:getHeight()
+  state.frameW, state.frameH = fw, fh
+
+  x11DrainEvents()
+  if state.xWindow == nil then return false end
+
+  local vw, vh = x11WindowSize()
+  if vw < 1 or vh < 1 then return false end
+  if not x11EnsureImage(vw, vh) then return false end
+
+  local src = state.ffi.cast("const uint8_t *", imageData:getFFIPointer())
+  local dst = state.ffi.cast("uint32_t *", state.xPixels)
+  local br = math.floor(state.bg / 0x10000) % 0x100
+  local bgc = math.floor(state.bg / 0x100) % 0x100
+  local bb = state.bg % 0x100
+  -- Little-endian 32bpp TrueColor packed as 0x00RRGGBB → bytes B,G,R,0
+  local bgPixel = bb + bgc * 0x100 + br * 0x10000
+  local dx, dy, dw, dh = Bridge.letterbox(vw, vh, fw, fh)
+
+  for i = 0, vw * vh - 1 do
+    dst[i] = bgPixel
+  end
+  if dw > 0 and dh > 0 then
+    for y = 0, dh - 1 do
+      local sy = math.min(fh - 1, math.floor(y * fh / dh))
+      local srcRow = sy * fw * 4
+      local dstRow = (y + dy) * vw + dx
+      for x = 0, dw - 1 do
+        local sx = math.min(fw - 1, math.floor(x * fw / dw))
+        local si = srcRow + sx * 4
+        local r, g, b = src[si], src[si + 1], src[si + 2]
+        dst[dstRow + x] = b + g * 0x100 + r * 0x10000
+      end
+    end
+  end
+
+  state.x11.XPutImage(
+    state.xDisplay, state.xWindow, state.xGc, state.xImage,
+    0, 0, 0, 0, vw, vh)
+  state.x11.XFlush(state.xDisplay)
+  -- Keep ImageData alive across the FFI pointer use.
+  state.pinImage = imageData
+  return true
+end
+
+local function initX11Backend(ffi)
+  breadcrumb("initX11Backend")
+  local defined, defErr = pcall(defineX11, ffi)
+  if not defined then
+    log("x11 cdef note: %s", tostring(defErr))
+  end
+  local x11, name = tryLoadX11(ffi)
+  if not x11 then
+    warn("libX11 not found")
+    return false
+  end
+  pcall(function() x11.XInitThreads() end)
+  local display = x11.XOpenDisplay(nil)
+  if display == nil then
+    warn("XOpenDisplay failed (Wayland-only session?)")
+    return false
+  end
+  local screen = x11.XDefaultScreen(display)
+  state.ffi = ffi
+  state.x11 = x11
+  state.xDisplay = display
+  state.xScreen = screen
+  state.xVisual = x11.XDefaultVisual(display, screen)
+  state.xDepth = x11.XDefaultDepth(display, screen)
+  state.xGc = x11.XDefaultGC(display, screen)
+  state.xWmDelete = x11.XInternAtom(display, "WM_DELETE_WINDOW", 0)
+  state.backend = "x11"
+  state.usable = true
+  log("desktop bridge ready via X11 (%s) depth=%s", tostring(name), tostring(state.xDepth))
+  return true
+end
+
+------------------------------------------------------------------------
+-- SDL companion (Windows / macOS; Linux fallback only)
+------------------------------------------------------------------------
+
+local function destroySdlWindow()
   local sdl = state.sdl
   if not sdl then
     state.window, state.renderer, state.texture, state.hwnd = nil, nil, nil, nil
     state.windowId = 0
     return
   end
-  if state.texture ~= nil then sdl.SDL_DestroyTexture(state.texture) end
-  if state.renderer ~= nil then sdl.SDL_DestroyRenderer(state.renderer) end
-  if state.window ~= nil then sdl.SDL_DestroyWindow(state.window) end
+  withHostGL(function()
+    if state.texture ~= nil then sdl.SDL_DestroyTexture(state.texture) end
+    if state.renderer ~= nil then sdl.SDL_DestroyRenderer(state.renderer) end
+    if state.window ~= nil then sdl.SDL_DestroyWindow(state.window) end
+  end)
   state.texture, state.renderer, state.window, state.hwnd = nil, nil, nil, nil
   state.windowId = 0
   state.pointerDown = false
@@ -347,9 +844,13 @@ local function destroyWindow()
   state.nativeAspect = false
 end
 
-------------------------------------------------------------------------
--- Native aspect-ratio locks
-------------------------------------------------------------------------
+local function destroyWindow()
+  if state.backend == "x11" then
+    x11DestroyWindow()
+  else
+    destroySdlWindow()
+  end
+end
 
 local function nativeWindowHandle(window)
   local sdl, ffi = state.sdl, state.ffi
@@ -365,7 +866,6 @@ local function nativeWindowHandle(window)
     return sdl.SDL_GetWindowWMInfo(window, info)
   end)
   if not ok then return nil, nil end
-  -- Some builds return SDL_bool; accept either non-zero / true.
   if result == 0 or result == false then return nil, nil end
   return info.native_window, tonumber(info.subsystem)
 end
@@ -400,8 +900,6 @@ local function lockAspectCocoa(nswindow)
 end
 
 local function applyWinSizing(rect, edge)
-  local ffi = state.ffi
-  -- RECT { LONG left, top, right, bottom }
   local left, top = tonumber(rect.left), tonumber(rect.top)
   local right, bottom = tonumber(rect.right), tonumber(rect.bottom)
   local w = right - left
@@ -410,10 +908,7 @@ local function applyWinSizing(rect, edge)
   if h < FRAME_H then h = FRAME_H end
 
   local edgeN = tonumber(edge) or 0
-  local widthDriven = (edgeN == WMSZ_LEFT or edgeN == WMSZ_RIGHT
-    or edgeN == WMSZ_TOPLEFT or edgeN == WMSZ_TOPRIGHT
-    or edgeN == WMSZ_BOTTOMLEFT or edgeN == WMSZ_BOTTOMRIGHT)
-  -- Prefer the axis the user is primarily dragging.
+  local widthDriven
   if edgeN == WMSZ_TOP or edgeN == WMSZ_BOTTOM then
     widthDriven = false
   elseif edgeN == WMSZ_LEFT or edgeN == WMSZ_RIGHT then
@@ -466,10 +961,7 @@ end
 
 local function lockNativeAspect(window)
   local ffi = state.ffi
-  if not wantsNativeWMInfo(ffi) then
-    -- Linux: per-frame SetWindowSize fallback only (see enforceAspect).
-    return false
-  end
+  if not wantsNativeWMInfo(ffi) then return false end
   local handle = nativeWindowHandle(window)
   if not handle or handle == nil then
     warn("SDL_GetWindowWMInfo unavailable; using per-frame aspect fallback")
@@ -484,10 +976,6 @@ local function lockNativeAspect(window)
   end
   return false
 end
-
-------------------------------------------------------------------------
--- Window lifecycle
-------------------------------------------------------------------------
 
 local function windowSize()
   local sdl, ffi = state.sdl, state.ffi
@@ -504,27 +992,19 @@ local function enforceAspect()
   local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
   if nw == cw and nh == ch then return end
   state.aspectLock = true
-  sdl.SDL_SetWindowSize(state.window, nw, nh)
+  withHostGL(function()
+    sdl.SDL_SetWindowSize(state.window, nw, nh)
+  end)
   state.aspectLock = false
 end
 
-local function createCompanionRenderer(sdl, ffi, window)
-  local attempts
-  if preferSoftwareRenderer(ffi) then
-    attempts = {
-      SDL_RENDERER_SOFTWARE,
-      SDL_RENDERER_SOFTWARE + SDL_RENDERER_PRESENTVSYNC,
-      SDL_RENDERER_ACCELERATED,
-      0,
-    }
-  else
-    attempts = {
-      SDL_RENDERER_ACCELERATED + SDL_RENDERER_PRESENTVSYNC,
-      SDL_RENDERER_ACCELERATED,
-      SDL_RENDERER_SOFTWARE,
-      0,
-    }
-  end
+local function createCompanionRenderer(sdl, window)
+  local attempts = {
+    SDL_RENDERER_ACCELERATED + SDL_RENDERER_PRESENTVSYNC,
+    SDL_RENDERER_ACCELERATED,
+    SDL_RENDERER_SOFTWARE,
+    0,
+  }
   for _, flags in ipairs(attempts) do
     local renderer = sdl.SDL_CreateRenderer(window, -1, flags)
     if renderer ~= nil then
@@ -534,59 +1014,54 @@ local function createCompanionRenderer(sdl, ffi, window)
   return nil, nil
 end
 
-local function ensureWindow()
+local function ensureSdlWindow()
   if state.window ~= nil then return true end
   if not state.usable or not state.sdl then return false end
   if state.userClosed then return false end
 
-  local sdl, ffi = state.sdl, state.ffi
-  local w = FRAME_W * DEFAULT_SCALE
-  local h = FRAME_H * DEFAULT_SCALE
-  -- High-DPI flag is useful on Cocoa/Win; on Linux it can interact badly
-  -- with compositor scaling when a second window is created via FFI.
-  local flags = SDL_WINDOW_RESIZABLE
-  if ffi.os == "OSX" or ffi.os == "Windows" then
-    flags = flags + SDL_WINDOW_ALLOW_HIGHDPI
-  end
-  local window = sdl.SDL_CreateWindow(
-    "Kanto Gear",
-    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-    w, h,
-    flags)
-  if window == nil then
-    warn("SDL_CreateWindow failed: %s", tostring(sdl.SDL_GetError()))
-    return false
-  end
+  return withHostGL(function()
+    local sdl, ffi = state.sdl, state.ffi
+    local w = FRAME_W * DEFAULT_SCALE
+    local h = FRAME_H * DEFAULT_SCALE
+    local flags = SDL_WINDOW_RESIZABLE + SDL_WINDOW_ALLOW_HIGHDPI
+    local window = sdl.SDL_CreateWindow(
+      "Kanto Gear",
+      SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+      w, h, flags)
+    if window == nil then
+      warn("SDL_CreateWindow failed: %s", tostring(sdl.SDL_GetError()))
+      return false
+    end
 
-  local renderer, rflags = createCompanionRenderer(sdl, ffi, window)
-  if renderer == nil then
-    warn("SDL_CreateRenderer failed: %s", tostring(sdl.SDL_GetError()))
-    sdl.SDL_DestroyWindow(window)
-    return false
-  end
+    local renderer, rflags = createCompanionRenderer(sdl, window)
+    if renderer == nil then
+      warn("SDL_CreateRenderer failed: %s", tostring(sdl.SDL_GetError()))
+      sdl.SDL_DestroyWindow(window)
+      return false
+    end
 
-  local texture = sdl.SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
-    SDL_TEXTUREACCESS_STREAMING, FRAME_W, FRAME_H)
-  if texture == nil then
-    warn("SDL_CreateTexture failed: %s", tostring(sdl.SDL_GetError()))
-    sdl.SDL_DestroyRenderer(renderer)
-    sdl.SDL_DestroyWindow(window)
-    return false
-  end
-  pcall(function() sdl.SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest) end)
-  pcall(function() sdl.SDL_SetWindowMinimumSize(window, FRAME_W, FRAME_H) end)
+    local texture = sdl.SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+      SDL_TEXTUREACCESS_STREAMING, FRAME_W, FRAME_H)
+    if texture == nil then
+      warn("SDL_CreateTexture failed: %s", tostring(sdl.SDL_GetError()))
+      sdl.SDL_DestroyRenderer(renderer)
+      sdl.SDL_DestroyWindow(window)
+      return false
+    end
+    pcall(function() sdl.SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest) end)
+    pcall(function() sdl.SDL_SetWindowMinimumSize(window, FRAME_W, FRAME_H) end)
 
-  state.window = window
-  state.renderer = renderer
-  state.texture = texture
-  state.windowId = tonumber(sdl.SDL_GetWindowID(window)) or 0
-  state.frameW, state.frameH = FRAME_W, FRAME_H
-  lockNativeAspect(window)
-  -- Immediate snap in case the OS ignored the initial size.
-  enforceAspect()
-  log("companion window opened id=%s nativeAspect=%s rendererFlags=%s",
-    tostring(state.windowId), tostring(state.nativeAspect), tostring(rflags))
-  return true
+    state.window = window
+    state.renderer = renderer
+    state.texture = texture
+    state.windowId = tonumber(sdl.SDL_GetWindowID(window)) or 0
+    state.frameW, state.frameH = FRAME_W, FRAME_H
+    lockNativeAspect(window)
+    enforceAspect()
+    log("sdl companion window opened id=%s nativeAspect=%s rendererFlags=%s",
+      tostring(state.windowId), tostring(state.nativeAspect), tostring(rflags))
+    return true
+  end)
 end
 
 local function mainWindowOpen()
@@ -621,9 +1096,11 @@ end
 local function drainWindowEvents()
   local sdl, ffi = state.sdl, state.ffi
   if not sdl or state.window == nil then return end
-  sdl.SDL_PumpEvents()
+  -- Do not PumpEvents on Linux fallback; LÖVE owns the queue.
+  if ffi.os ~= "Linux" then
+    sdl.SDL_PumpEvents()
+  end
 
-  -- Windows live-resize hook (WM_SIZING).
   if ffi.os == "Windows" then
     local sys = ffi.new("SDL_Event[16]")
     local n = sdl.SDL_PeepEvents(sys, 16, SDL_GETEVENT, SDL_SYSWMEVENT, SDL_SYSWMEVENT)
@@ -642,12 +1119,12 @@ local function drainWindowEvents()
     local ev = events[i]
     local kind = ev.window.event
     if ev.window.windowID == state.windowId then
-      if kind == 14 then -- CLOSE
+      if kind == 14 then
         log("companion window closed by user")
         state.userClosed = true
         destroyWindow()
         enqueueTouch("cancel,0,0")
-      elseif kind == 5 or kind == 6 then -- RESIZED / SIZE_CHANGED
+      elseif kind == 5 or kind == 6 then
         enforceAspect()
       end
     else
@@ -708,7 +1185,77 @@ local function pollMouse()
   state.prevButtons = buttons
 end
 
+local function presentSdl(imageData, backgroundColor)
+  local okEnsure, ensured = pcall(ensureSdlWindow)
+  if not okEnsure then
+    warn("companion ensureWindow error: %s", tostring(ensured))
+    destroyWindow()
+    return false
+  end
+  if not ensured then return false end
+
+  pcall(enforceAspect)
+  state.pinImage = imageData
+
+  local fw = imageData:getWidth()
+  local fh = imageData:getHeight()
+
+  local okPresent, presentErr = pcall(function()
+    withHostGL(function()
+      if fw ~= state.frameW or fh ~= state.frameH then
+        local sdl = state.sdl
+        if state.texture ~= nil then
+          sdl.SDL_DestroyTexture(state.texture)
+          state.texture = nil
+        end
+        state.texture = sdl.SDL_CreateTexture(state.renderer, SDL_PIXELFORMAT_RGBA32,
+          SDL_TEXTUREACCESS_STREAMING, fw, fh)
+        if state.texture == nil then
+          error("SDL_CreateTexture failed: " .. tostring(sdl.SDL_GetError()))
+        end
+        pcall(function()
+          sdl.SDL_SetTextureScaleMode(state.texture, SDL_ScaleModeNearest)
+        end)
+        state.frameW, state.frameH = fw, fh
+      end
+
+      state.bg = backgroundColor or state.bg
+      local ptr = imageData:getFFIPointer()
+      if state.sdl.SDL_UpdateTexture(state.texture, nil, ptr, fw * 4) ~= 0 then
+        error("SDL_UpdateTexture failed: " .. tostring(state.sdl.SDL_GetError()))
+      end
+
+      local r = math.floor(state.bg / 0x10000) % 0x100
+      local g = math.floor(state.bg / 0x100) % 0x100
+      local b = state.bg % 0x100
+      state.sdl.SDL_SetRenderDrawColor(state.renderer, r, g, b, 255)
+      state.sdl.SDL_RenderClear(state.renderer)
+
+      local vw, vh = windowSize()
+      local dx, dy, dw, dh = Bridge.letterbox(vw, vh, state.frameW, state.frameH)
+      local dest = state.ffi.new("SDL_Rect", { x = dx, y = dy, w = dw, h = dh })
+      state.sdl.SDL_RenderCopy(state.renderer, state.texture, nil, dest)
+      state.sdl.SDL_RenderPresent(state.renderer)
+    end)
+  end)
+
+  if not okPresent then
+    warn("companion present error: %s", tostring(presentErr))
+    destroyWindow()
+    return false
+  end
+
+  pcall(drainWindowEvents)
+  if state.window ~= nil then pcall(enforceAspect) end
+  return state.window ~= nil
+end
+
+------------------------------------------------------------------------
+-- Shared present / poll API
+------------------------------------------------------------------------
+
 local function present(imageData, backgroundColor, _preference)
+  breadcrumb("present backend=" .. tostring(state.backend))
   if not state.usable then return false end
   if not mainWindowOpen() then
     destroyWindow()
@@ -723,70 +1270,20 @@ local function present(imageData, backgroundColor, _preference)
   if not imageData.getWidth or not imageData.getFFIPointer then
     return false
   end
-
   local fw = imageData:getWidth()
   local fh = imageData:getHeight()
   if fw <= 0 or fh <= 0 then return false end
 
-  local okEnsure, ensured = pcall(ensureWindow)
-  if not okEnsure then
-    warn("companion ensureWindow error: %s", tostring(ensured))
-    destroyWindow()
-    return false
-  end
-  if not ensured then return false end
-
-  -- LÖVE eats most WINDOWEVENTs for foreign windows, so never rely on them
-  -- alone: correct the OS window size every presented frame.
-  pcall(enforceAspect)
-
-  local okPresent, presentErr = pcall(function()
-    if fw ~= state.frameW or fh ~= state.frameH then
-      local sdl = state.sdl
-      if state.texture ~= nil then
-        sdl.SDL_DestroyTexture(state.texture)
-        state.texture = nil
-      end
-      state.texture = sdl.SDL_CreateTexture(state.renderer, SDL_PIXELFORMAT_RGBA32,
-        SDL_TEXTUREACCESS_STREAMING, fw, fh)
-      if state.texture == nil then
-        error("SDL_CreateTexture failed: " .. tostring(sdl.SDL_GetError()))
-      end
-      pcall(function()
-        sdl.SDL_SetTextureScaleMode(state.texture, SDL_ScaleModeNearest)
-      end)
-      state.frameW, state.frameH = fw, fh
+  if state.backend == "x11" then
+    local ok, result = pcall(x11Present, imageData, backgroundColor)
+    if not ok then
+      warn("x11 present error: %s", tostring(result))
+      x11DestroyWindow()
+      return false
     end
-
-    state.bg = backgroundColor or state.bg
-    local ptr = imageData:getFFIPointer()
-    if state.sdl.SDL_UpdateTexture(state.texture, nil, ptr, fw * 4) ~= 0 then
-      error("SDL_UpdateTexture failed: " .. tostring(state.sdl.SDL_GetError()))
-    end
-
-    local r = math.floor(state.bg / 0x10000) % 0x100
-    local g = math.floor(state.bg / 0x100) % 0x100
-    local b = state.bg % 0x100
-    state.sdl.SDL_SetRenderDrawColor(state.renderer, r, g, b, 255)
-    state.sdl.SDL_RenderClear(state.renderer)
-
-    local vw, vh = windowSize()
-    local dx, dy, dw, dh = Bridge.letterbox(vw, vh, state.frameW, state.frameH)
-    local dest = state.ffi.new("SDL_Rect", { x = dx, y = dy, w = dw, h = dh })
-    state.sdl.SDL_RenderCopy(state.renderer, state.texture, nil, dest)
-    state.sdl.SDL_RenderPresent(state.renderer)
-  end)
-
-  if not okPresent then
-    warn("companion present error: %s", tostring(presentErr))
-    destroyWindow()
-    return false
+    return result and state.xWindow ~= nil
   end
-
-  pcall(drainWindowEvents)
-  -- One more pass after events (macOS often applies the drag size at end).
-  if state.window ~= nil then pcall(enforceAspect) end
-  return state.window ~= nil
+  return presentSdl(imageData, backgroundColor)
 end
 
 local function hasSecondaryDisplay()
@@ -799,10 +1296,14 @@ local function pollSecondaryDisplayTouch()
     destroyWindow()
     return nil
   end
-  drainWindowEvents()
-  if state.window ~= nil then
-    enforceAspect()
-    pollMouse()
+  if state.backend == "x11" then
+    if state.xWindow ~= nil then x11DrainEvents() end
+  else
+    drainWindowEvents()
+    if state.window ~= nil then
+      enforceAspect()
+      pollMouse()
+    end
   end
   if #state.touches == 0 then return nil end
   return table.remove(state.touches, 1)
@@ -813,10 +1314,6 @@ local function closeSecondaryDisplay()
   destroyWindow()
   state.touches = {}
 end
-
-------------------------------------------------------------------------
--- Canvas readback polyfill
-------------------------------------------------------------------------
 
 local function installCanvasReadback(canvas)
   if not canvas or canvas.requestImageData then return canvas end
@@ -838,29 +1335,11 @@ local function installCanvasReadback(canvas)
   return canvas
 end
 
-------------------------------------------------------------------------
--- Public install
-------------------------------------------------------------------------
-
-function Bridge.install(mod)
-  if state.installed then return state.usable end
-  state.installed = true
-  state.log = mod and mod.log or nil
-
-  local runtime = rawget(_G, "love")
-  local system = runtime and runtime.system
-  if system and system.hasSecondaryDisplay and system.presentSecondaryDisplay
-      and system.pollSecondaryDisplayTouch then
-    state.usable = false
-    state.reason = "host bridge present"
-    log("desktop bridge skipped; host secondary-display APIs present")
-    return false
-  end
-
-  local ok, ffi = pcall(require, "ffi")
-  if not (ok and ffi) then
-    state.reason = "ffi unavailable"
-    warn("desktop bridge inactive: %s", state.reason)
+local function initSdlBackend(ffi)
+  breadcrumb("initSdlBackend os=" .. tostring(ffi.os))
+  -- Linux must not use a second SDL window; caller should prefer X11.
+  if ffi.os == "Linux" then
+    warn("refusing SDL companion backend on Linux (use X11)")
     return false
   end
 
@@ -881,8 +1360,53 @@ function Bridge.install(mod)
     return false
   end
 
-  state.ffi, state.sdl, state.usable = ffi, sdl, true
-  log("desktop bridge ready via %s (%s)", tostring(sdlName), tostring(ffi.os))
+  state.ffi, state.sdl = ffi, sdl
+  state.backend = "sdl"
+  state.usable = true
+  log("desktop bridge ready via SDL %s (%s)", tostring(sdlName), tostring(ffi.os))
+  return true
+end
+
+------------------------------------------------------------------------
+-- Public install
+------------------------------------------------------------------------
+
+function Bridge.install(mod)
+  if state.installed then return state.usable end
+  state.installed = true
+  state.log = mod and mod.log or nil
+  breadcrumb("Bridge.install")
+
+  local runtime = rawget(_G, "love")
+  local system = runtime and runtime.system
+  if system and system.hasSecondaryDisplay and system.presentSecondaryDisplay
+      and system.pollSecondaryDisplayTouch then
+    state.usable = false
+    state.reason = "host bridge present"
+    log("desktop bridge skipped; host secondary-display APIs present")
+    return false
+  end
+
+  local ok, ffi = pcall(require, "ffi")
+  if not (ok and ffi) then
+    state.reason = "ffi unavailable"
+    warn("desktop bridge inactive: %s", state.reason)
+    return false
+  end
+  state.ffi = ffi
+
+  local ready = false
+  if ffi.os == "Linux" then
+    ready = initX11Backend(ffi)
+    if not ready then
+      state.reason = "X11 companion unavailable"
+      warn("desktop bridge inactive on Linux: %s", state.reason)
+      return false
+    end
+  else
+    ready = initSdlBackend(ffi)
+    if not ready then return false end
+  end
 
   if not system then
     warn("desktop bridge inactive: love.system missing")
@@ -900,6 +1424,7 @@ function Bridge.install(mod)
       local prevQuit = runtime.quit
       runtime.quit = function(...)
         destroyWindow()
+        if state.backend == "x11" then x11CloseDisplay() end
         if type(prevQuit) == "function" then return prevQuit(...) end
       end
     end)
@@ -908,6 +1433,7 @@ function Bridge.install(mod)
       local prev = runtime.handlers.quit
       runtime.handlers.quit = function(...)
         destroyWindow()
+        if state.backend == "x11" then x11CloseDisplay() end
         if type(prev) == "function" then return prev(...) end
       end
     end)
