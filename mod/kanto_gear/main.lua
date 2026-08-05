@@ -587,8 +587,8 @@ end
 return function(mod)
   mod.options:define({
     { key = "theme", label = "BOTTOM THEME", type = "choice",
-      default = "kanto", choices = {
-        { "KANTO GREEN", "kanto" }, { "MATCH GAME", "match" },
+      default = "match", choices = {
+        { "MATCH GAME", "match" }, { "KANTO GREEN", "kanto" },
         { "OG", "og" }, { "OG INVERTED", "og_inv" },
         { "SGB", "sgb" }, { "ADVANCED", "advanced" },
         { "VERSION COLOR", "version" },
@@ -801,7 +801,7 @@ return function(mod)
   end
 
   local function refreshTheme(force)
-    local theme = mod.options:get("theme") or "kanto"
+    local theme = mod.options:get("theme") or "match"
     local key = theme .. (theme == "match" and (":" .. PaletteFX.mode) or "")
     if not force and key == themeKey then return end
     usePalette(themePalette(theme))
