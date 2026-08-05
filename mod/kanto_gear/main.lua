@@ -3160,14 +3160,16 @@ return function(mod)
     end
 
     local now = love.timer.getTime()
+    -- Pump the companion every frame so Linux X11 aspect lock / expose
+    -- redraw can keep up with live window-manager resize drags.
+    for _ = 1, 32 do
+      local event = system.pollSecondaryDisplayTouch()
+      if not event then break end
+      touchEvent(event)
+    end
     if now >= nextPoll then
       nextPoll = now + 0.05
       refreshTheme()
-      for _ = 1, 32 do
-        local event = system.pollSecondaryDisplayTouch()
-        if not event then break end
-        touchEvent(event)
-      end
       refreshBattle()
       if page == "TOOLS" or pendingAction then refreshTools() end
       local mode, top = screenState()

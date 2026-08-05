@@ -46,8 +46,37 @@ function Bridge.constrainAspect(w, h, fw, fh)
     h = math.max(fh, h)
     w = math.max(fw, math.floor(h * fw / fh + 0.5))
   end
+  -- Final exact snap from width so floating error cannot drift the ratio.
   h = math.max(fh, math.floor(w * fh / fw + 0.5))
   return w, h, w / fw
+end
+
+-- Like constrainAspect, but prefers the axis that changed more since the last
+-- locked size. Needed during live window-manager drags where both width and
+-- height jitter every ConfigureNotify.
+function Bridge.constrainAspectDrag(w, h, prevW, prevH, fw, fh)
+  fw = fw or FRAME_W
+  fh = fh or FRAME_H
+  w = math.max(1, math.floor(tonumber(w) or fw))
+  h = math.max(1, math.floor(tonumber(h) or fh))
+  prevW = math.max(1, math.floor(tonumber(prevW) or w))
+  prevH = math.max(1, math.floor(tonumber(prevH) or h))
+  local dw = math.abs(w - prevW)
+  local dh = math.abs(h - prevH)
+  local widthDriven
+  if dw == 0 and dh == 0 then
+    widthDriven = (w / fw) >= (h / fh)
+  else
+    widthDriven = dw >= dh
+  end
+  if widthDriven then
+    w = math.max(fw, w)
+    h = math.max(fh, math.floor(w * fh / fw + 0.5))
+  else
+    h = math.max(fh, h)
+    w = math.max(fw, math.floor(h * fw / fh + 0.5))
+  end
+  return w, h, widthDriven
 end
 
 function Bridge.logicalPoint(x, y, vw, vh, fw, fh)
@@ -103,6 +132,8 @@ local state = {
   needsRedraw = false,
   aspectTargetW = 0,
   aspectTargetH = 0,
+  lastLockedW = 0,
+  lastLockedH = 0,
   bg = 0x0F380F,
   touches = {},
   prevButtons = 0,
@@ -155,6 +186,8 @@ local X_ZPixmap = 2
 local X_PMinSize = 16
 local X_PAspect = 256
 local X_PBaseSize = 512
+local X_CWWidth = 4
+local X_CWHeight = 8
 
 local function breadcrumb(msg)
   pcall(function()
@@ -517,6 +550,15 @@ local function defineX11(ffi)
     int XSync(Display *display, int discard);
     int XDestroyWindow(Display *display, Window w);
     int XResizeWindow(Display *display, Window w, unsigned int width, unsigned int height);
+    typedef struct {
+      int x, y;
+      int width, height;
+      int border_width;
+      Window sibling;
+      int stack_mode;
+    } XWindowChanges;
+    int XConfigureWindow(Display *display, Window w, unsigned int value_mask,
+      XWindowChanges *changes);
     int XGetGeometry(Display *display, Drawable d, Window *root,
       int *x, int *y, unsigned int *width, unsigned int *height,
       unsigned int *border_width, unsigned int *depth);
@@ -654,6 +696,7 @@ local function x11EnsureWindow()
 
   state.xWindow = win
   state.xWinW, state.xWinH = w, h
+  state.lastLockedW, state.lastLockedH = w, h
   state.frameW, state.frameH = FRAME_W, FRAME_H
   state.nativeAspect = true
   log("x11 companion window opened %dx%d", w, h)
@@ -680,27 +723,47 @@ local function x11WindowSize()
   return state.xWinW, state.xWinH
 end
 
+local function x11ApplySize(nw, nh)
+  local ffi, x11 = state.ffi, state.x11
+  if not x11 or state.xWindow == nil then return end
+  nw = math.max(FRAME_W, math.floor(nw))
+  nh = math.max(FRAME_H, math.floor(nh))
+  state.aspectTargetW, state.aspectTargetH = nw, nh
+  pcall(function()
+    if x11.XConfigureWindow then
+      local changes = ffi.new("XWindowChanges")
+      changes.width = nw
+      changes.height = nh
+      x11.XConfigureWindow(state.xDisplay, state.xWindow, X_CWWidth + X_CWHeight, changes)
+    else
+      x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
+    end
+    if x11.XSync then
+      x11.XSync(state.xDisplay, 0)
+    else
+      x11.XFlush(state.xDisplay)
+    end
+  end)
+  state.xWinW, state.xWinH = nw, nh
+  state.lastLockedW, state.lastLockedH = nw, nh
+  state.needsRedraw = true
+end
+
 -- Snap the OS window onto 160:144. Many WMs ignore PAspect during live
--- drag, so we correct with XResizeWindow and also use the snapped size for
--- the next blit even before the ConfigureNotify lands.
+-- drag; we keep forcing the locked size from the dominant drag axis.
 local function x11EnforceAspect(force)
   if state.xWindow == nil or not state.x11 then return state.xWinW, state.xWinH end
   if state.aspectLock and not force then return state.xWinW, state.xWinH end
   local cw, ch = x11WindowSize()
-  local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
+  local prevW = state.lastLockedW > 0 and state.lastLockedW or cw
+  local prevH = state.lastLockedH > 0 and state.lastLockedH or ch
+  local nw, nh = Bridge.constrainAspectDrag(cw, ch, prevW, prevH, FRAME_W, FRAME_H)
   if nw == cw and nh == ch then
-    state.aspectLock = false
+    state.lastLockedW, state.lastLockedH = cw, ch
     return cw, ch
   end
   state.aspectLock = true
-  state.aspectTargetW, state.aspectTargetH = nw, nh
-  pcall(function()
-    state.x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
-    state.x11.XSync(state.xDisplay, 0)
-  end)
-  state.xWinW, state.xWinH = nw, nh
-  state.needsRedraw = true
-  -- Allow further corrects on the next event; Sync should have applied.
+  x11ApplySize(nw, nh)
   state.aspectLock = false
   return nw, nh
 end
@@ -714,7 +777,7 @@ local function x11Blit(imageData)
   if fw <= 0 or fh <= 0 then return false end
   state.frameW, state.frameH = fw, fh
 
-  local vw, vh = x11EnforceAspect(false)
+  local vw, vh = x11EnforceAspect(true)
   if vw < 1 or vh < 1 then return false end
   if not x11EnsureImage(vw, vh) then return false end
 
@@ -756,7 +819,7 @@ local function x11DrainEvents()
   local ffi, x11 = state.ffi, state.x11
   if not x11 or state.xDisplay == nil or state.xWindow == nil then return end
   local ev = ffi.new("XEvent")
-  local resized = false
+  local cfgW, cfgH = nil, nil
   while x11.XPending(state.xDisplay) > 0 do
     x11.XNextEvent(state.xDisplay, ev)
     local t = ev.type
@@ -781,22 +844,13 @@ local function x11DrainEvents()
       end
     elseif t == X_ConfigureNotify then
       if ev.xconfigure.window == state.xWindow then
-        local cw = tonumber(ev.xconfigure.width) or state.xWinW
-        local ch = tonumber(ev.xconfigure.height) or state.xWinH
-        state.xWinW, state.xWinH = cw, ch
+        -- Last ConfigureNotify in the batch wins; correcting mid-batch let
+        -- later WM sizes overwrite our lock while the user kept dragging.
+        cfgW = tonumber(ev.xconfigure.width) or cfgW
+        cfgH = tonumber(ev.xconfigure.height) or cfgH
         state.needsRedraw = true
-        local nw, nh = Bridge.constrainAspect(cw, ch, FRAME_W, FRAME_H)
-        if (nw ~= cw or nh ~= ch) and not resized then
-          resized = true
-          state.aspectTargetW, state.aspectTargetH = nw, nh
-          pcall(function()
-            x11.XResizeWindow(state.xDisplay, state.xWindow, nw, nh)
-          end)
-          state.xWinW, state.xWinH = nw, nh
-        end
       end
     elseif t == X_Expose then
-      -- count==0 means this is the last expose in a batch
       state.needsRedraw = true
     elseif t == X_ButtonPress or t == X_ButtonRelease then
       if ev.xbutton.window == state.xWindow and ev.xbutton.button == 1 then
@@ -822,11 +876,58 @@ local function x11DrainEvents()
       end
     end
   end
-  if resized then
-    pcall(function() x11.XSync(state.xDisplay, 0) end)
+
+  if cfgW and cfgH and state.xWindow ~= nil then
+    local prevW = state.lastLockedW > 0 and state.lastLockedW or cfgW
+    local prevH = state.lastLockedH > 0 and state.lastLockedH or cfgH
+    local nw, nh = Bridge.constrainAspectDrag(cfgW, cfgH, prevW, prevH, FRAME_W, FRAME_H)
+    state.xWinW, state.xWinH = cfgW, cfgH
+    if nw ~= cfgW or nh ~= cfgH then
+      x11ApplySize(nw, nh)
+      -- Eat follow-up configures from our own snap so the next drain does
+      -- not treat them as a new user drag away from the lock.
+      local guard = 0
+      while guard < 16 and x11.XPending(state.xDisplay) > 0 do
+        guard = guard + 1
+        x11.XNextEvent(state.xDisplay, ev)
+        if ev.type == X_ConfigureNotify and ev.xconfigure.window == state.xWindow then
+          local aw = tonumber(ev.xconfigure.width) or nw
+          local ah = tonumber(ev.xconfigure.height) or nh
+          if aw ~= nw or ah ~= nh then
+            x11ApplySize(nw, nh)
+          else
+            state.xWinW, state.xWinH = aw, ah
+            state.lastLockedW, state.lastLockedH = aw, ah
+          end
+        elseif ev.type == X_Expose then
+          state.needsRedraw = true
+        elseif ev.type == X_ClientMessage or ev.type == X_DestroyNotify
+            or ev.type == X_ButtonPress or ev.type == X_ButtonRelease then
+          -- Put non-configure events back by handling them on next poll; for
+          -- close/destroy handle immediately.
+          if ev.type == X_ClientMessage then
+            local atom = tonumber(ffi.cast("unsigned long", ev.xclient.data_l[0]))
+            local del = tonumber(ffi.cast("unsigned long", state.xWmDelete))
+            if atom == del then
+              state.userClosed = true
+              x11DestroyWindow()
+              enqueueTouch("cancel,0,0")
+              return
+            end
+          elseif ev.type == X_DestroyNotify then
+            state.userClosed = true
+            x11DestroyWindow()
+            enqueueTouch("cancel,0,0")
+            return
+          end
+        end
+      end
+    else
+      state.lastLockedW, state.lastLockedH = cfgW, cfgH
+    end
   end
-  -- Live resize clears the X11 backing store; repaint from the last frame
-  -- immediately so the window does not stay black until the next game tick.
+
+  -- Live resize clears the X11 backing store; repaint from the last frame.
   if state.needsRedraw and state.pinImage ~= nil and state.xWindow ~= nil then
     pcall(x11Blit, state.pinImage)
   end
@@ -858,7 +959,18 @@ local function initX11Backend(ffi)
   end
   pcall(function() x11.XInitThreads() end)
   pcall(function()
-    ffi.cdef[[ int XSync(Display *display, int discard); ]]
+    ffi.cdef[[
+      int XSync(Display *display, int discard);
+      typedef struct {
+        int x, y;
+        int width, height;
+        int border_width;
+        Window sibling;
+        int stack_mode;
+      } XWindowChanges;
+      int XConfigureWindow(Display *display, Window w, unsigned int value_mask,
+        XWindowChanges *changes);
+    ]]
   end)
   local display = x11.XOpenDisplay(nil)
   if display == nil then

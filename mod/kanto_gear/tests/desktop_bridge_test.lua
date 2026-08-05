@@ -85,6 +85,21 @@ do
   eq(h, 432, "exact 3x height unchanged")
 end
 
+-- Drag-aware aspect: width-dominant when width changed more
+do
+  local w, h, widthDriven = Bridge.constrainAspectDrag(700, 300, 480, 432, 160, 144)
+  check(widthDriven == true, "wide drag is width-driven")
+  eq(w * 144, h * 160, "wide drag keeps aspect product")
+  eq(w, 700, "wide drag keeps proposed width")
+end
+-- Height-dominant when height changed more
+do
+  local w, h, widthDriven = Bridge.constrainAspectDrag(200, 900, 480, 432, 160, 144)
+  check(widthDriven == false, "tall drag is height-driven")
+  eq(w * 144, h * 160, "tall drag keeps aspect product")
+  eq(h, 900, "tall drag keeps proposed height")
+end
+
 -- rgb24 helper
 do
   local r, g, b = Bridge.rgb24ToFloat(0x0F380F)
