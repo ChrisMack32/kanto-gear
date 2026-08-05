@@ -74,17 +74,61 @@ end
 -- SDL loader
 ------------------------------------------------------------------------
 
+-- Prefer the SDL2 already mapped into this process (LÖVE / Gen1Recomp).
+-- Loading a second, different libSDL2.so on Linux (system vs AppImage)
+-- creates a parallel SDL instance and hard-crashes shortly after window
+-- create / present.
+local function findMappedSDL(ffi)
+  if ffi.os == "Windows" then return nil end
+  local mapsPath = "/proc/self/maps"
+  local f = io.open(mapsPath, "r")
+  if not f then return nil end
+  local best, bestScore = nil, -1
+  for line in f:lines() do
+    -- pathname is the last whitespace-separated field when present
+    local path = line:match("%s(/[^%s]+)$")
+    if path and path:find("libSDL2", 1, true) and path:find("%.so", 1, true)
+        and not path:find("libSDL2_image", 1, true)
+        and not path:find("libSDL2_mixer", 1, true)
+        and not path:find("libSDL2_ttf", 1, true)
+        and not path:find("libSDL2_net", 1, true) then
+      local score = 1
+      if path:find("libSDL2%-2%.0%.so%.0") then
+        score = 4
+      elseif path:find("libSDL2%-2%.0%.so") then
+        score = 3
+      elseif path:find("libSDL2%.so") then
+        score = 2
+      end
+      if score > bestScore then
+        best, bestScore = path, score
+      end
+    end
+  end
+  f:close()
+  return best
+end
+
 local function tryLoadSDL(ffi)
-  local names
+  local names = {}
+  local mapped = findMappedSDL(ffi)
+  if mapped then
+    names[#names + 1] = mapped
+  end
   if ffi.os == "Windows" then
-    names = { "SDL2", "SDL2.dll" }
+    names[#names + 1] = "SDL2"
+    names[#names + 1] = "SDL2.dll"
   elseif ffi.os == "OSX" then
-    names = {
-      "SDL2", "libSDL2-2.0.0.dylib", "libSDL2.dylib",
-      "/usr/local/lib/libSDL2.dylib", "/opt/homebrew/lib/libSDL2.dylib",
-    }
+    names[#names + 1] = "SDL2"
+    names[#names + 1] = "libSDL2-2.0.0.dylib"
+    names[#names + 1] = "libSDL2.dylib"
+    names[#names + 1] = "/usr/local/lib/libSDL2.dylib"
+    names[#names + 1] = "/opt/homebrew/lib/libSDL2.dylib"
   else
-    names = { "SDL2", "libSDL2-2.0.so.0", "libSDL2.so", "libSDL2-2.0.so" }
+    names[#names + 1] = "SDL2"
+    names[#names + 1] = "libSDL2-2.0.so.0"
+    names[#names + 1] = "libSDL2.so"
+    names[#names + 1] = "libSDL2-2.0.so"
   end
 
   local okC = pcall(function() return ffi.C.SDL_CreateWindow end)
@@ -237,6 +281,7 @@ local state = {
 local SDL_WINDOWPOS_CENTERED = 0x2FFF0000
 local SDL_WINDOW_RESIZABLE = 0x00000020
 local SDL_WINDOW_ALLOW_HIGHDPI = 0x00002000
+local SDL_RENDERER_SOFTWARE = 0x00000001
 local SDL_RENDERER_ACCELERATED = 0x00000002
 local SDL_RENDERER_PRESENTVSYNC = 0x00000004
 local SDL_PIXELFORMAT_RGBA32 = 0x16762004
@@ -255,6 +300,20 @@ local WMSZ_TOPRIGHT = 5
 local WMSZ_BOTTOM = 6
 local WMSZ_BOTTOMLEFT = 7
 local WMSZ_BOTTOMRIGHT = 8
+
+-- Linux/X11 SysWMinfo layout differs enough that an incomplete FFI cdef
+-- writing through SDL_GetWindowWMInfo can corrupt the heap. Only call it
+-- on platforms where we actually need the native handle.
+local function wantsNativeWMInfo(ffi)
+  return ffi.os == "OSX" or ffi.os == "Windows"
+end
+
+-- A second accelerated GL/Vulkan SDL_Renderer fights LÖVE's GL context on
+-- Linux (especially Wayland / some NVIDIA drivers). Software is slower but
+-- process-safe for a tiny 160×144 companion blit.
+local function preferSoftwareRenderer(ffi)
+  return ffi.os ~= "OSX" and ffi.os ~= "Windows"
+end
 
 local function log(fmt, ...)
   if state.log then state.log:info(fmt, ...) end
@@ -295,20 +354,19 @@ end
 local function nativeWindowHandle(window)
   local sdl, ffi = state.sdl, state.ffi
   if not (sdl and sdl.SDL_GetWindowWMInfo) then return nil, nil end
+  if not wantsNativeWMInfo(ffi) then return nil, nil end
   local info = ffi.new("SDL_SysWMinfo")
   if sdl.SDL_GetVersion then
     sdl.SDL_GetVersion(info.version)
   else
     info.version.major, info.version.minor, info.version.patch = 2, 0, 0
   end
-  local ok = pcall(function()
-    assert(sdl.SDL_GetWindowWMInfo(window, info) ~= 0)
+  local ok, result = pcall(function()
+    return sdl.SDL_GetWindowWMInfo(window, info)
   end)
-  if not ok then
-    -- Some builds return SDL_bool; accept either.
-    local result = sdl.SDL_GetWindowWMInfo(window, info)
-    if result == 0 or result == false then return nil, nil end
-  end
+  if not ok then return nil, nil end
+  -- Some builds return SDL_bool; accept either non-zero / true.
+  if result == 0 or result == false then return nil, nil end
   return info.native_window, tonumber(info.subsystem)
 end
 
@@ -408,6 +466,10 @@ end
 
 local function lockNativeAspect(window)
   local ffi = state.ffi
+  if not wantsNativeWMInfo(ffi) then
+    -- Linux: per-frame SetWindowSize fallback only (see enforceAspect).
+    return false
+  end
   local handle = nativeWindowHandle(window)
   if not handle or handle == nil then
     warn("SDL_GetWindowWMInfo unavailable; using per-frame aspect fallback")
@@ -420,7 +482,6 @@ local function lockNativeAspect(window)
     enableWindowsSizingHook()
     return true
   end
-  -- Linux/X11: no portable size-hint helper here; per-frame fallback below.
   return false
 end
 
@@ -447,29 +508,57 @@ local function enforceAspect()
   state.aspectLock = false
 end
 
+local function createCompanionRenderer(sdl, ffi, window)
+  local attempts
+  if preferSoftwareRenderer(ffi) then
+    attempts = {
+      SDL_RENDERER_SOFTWARE,
+      SDL_RENDERER_SOFTWARE + SDL_RENDERER_PRESENTVSYNC,
+      SDL_RENDERER_ACCELERATED,
+      0,
+    }
+  else
+    attempts = {
+      SDL_RENDERER_ACCELERATED + SDL_RENDERER_PRESENTVSYNC,
+      SDL_RENDERER_ACCELERATED,
+      SDL_RENDERER_SOFTWARE,
+      0,
+    }
+  end
+  for _, flags in ipairs(attempts) do
+    local renderer = sdl.SDL_CreateRenderer(window, -1, flags)
+    if renderer ~= nil then
+      return renderer, flags
+    end
+  end
+  return nil, nil
+end
+
 local function ensureWindow()
   if state.window ~= nil then return true end
   if not state.usable or not state.sdl then return false end
   if state.userClosed then return false end
 
-  local sdl = state.sdl
+  local sdl, ffi = state.sdl, state.ffi
   local w = FRAME_W * DEFAULT_SCALE
   local h = FRAME_H * DEFAULT_SCALE
+  -- High-DPI flag is useful on Cocoa/Win; on Linux it can interact badly
+  -- with compositor scaling when a second window is created via FFI.
+  local flags = SDL_WINDOW_RESIZABLE
+  if ffi.os == "OSX" or ffi.os == "Windows" then
+    flags = flags + SDL_WINDOW_ALLOW_HIGHDPI
+  end
   local window = sdl.SDL_CreateWindow(
     "Kanto Gear",
     SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
     w, h,
-    SDL_WINDOW_RESIZABLE + SDL_WINDOW_ALLOW_HIGHDPI)
+    flags)
   if window == nil then
-    warn("SDL_CreateWindow failed: %s", tostring(state.sdl.SDL_GetError()))
+    warn("SDL_CreateWindow failed: %s", tostring(sdl.SDL_GetError()))
     return false
   end
 
-  local renderer = sdl.SDL_CreateRenderer(window, -1,
-    SDL_RENDERER_ACCELERATED + SDL_RENDERER_PRESENTVSYNC)
-  if renderer == nil then
-    renderer = sdl.SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED)
-  end
+  local renderer, rflags = createCompanionRenderer(sdl, ffi, window)
   if renderer == nil then
     warn("SDL_CreateRenderer failed: %s", tostring(sdl.SDL_GetError()))
     sdl.SDL_DestroyWindow(window)
@@ -495,8 +584,8 @@ local function ensureWindow()
   lockNativeAspect(window)
   -- Immediate snap in case the OS ignored the initial size.
   enforceAspect()
-  log("companion window opened id=%s nativeAspect=%s",
-    tostring(state.windowId), tostring(state.nativeAspect))
+  log("companion window opened id=%s nativeAspect=%s rendererFlags=%s",
+    tostring(state.windowId), tostring(state.nativeAspect), tostring(rflags))
   return true
 end
 
@@ -638,49 +727,65 @@ local function present(imageData, backgroundColor, _preference)
   local fw = imageData:getWidth()
   local fh = imageData:getHeight()
   if fw <= 0 or fh <= 0 then return false end
-  if not ensureWindow() then return false end
+
+  local okEnsure, ensured = pcall(ensureWindow)
+  if not okEnsure then
+    warn("companion ensureWindow error: %s", tostring(ensured))
+    destroyWindow()
+    return false
+  end
+  if not ensured then return false end
 
   -- LÖVE eats most WINDOWEVENTs for foreign windows, so never rely on them
   -- alone: correct the OS window size every presented frame.
-  enforceAspect()
+  pcall(enforceAspect)
 
-  if fw ~= state.frameW or fh ~= state.frameH then
-    local sdl = state.sdl
-    if state.texture ~= nil then
-      sdl.SDL_DestroyTexture(state.texture)
-      state.texture = nil
+  local okPresent, presentErr = pcall(function()
+    if fw ~= state.frameW or fh ~= state.frameH then
+      local sdl = state.sdl
+      if state.texture ~= nil then
+        sdl.SDL_DestroyTexture(state.texture)
+        state.texture = nil
+      end
+      state.texture = sdl.SDL_CreateTexture(state.renderer, SDL_PIXELFORMAT_RGBA32,
+        SDL_TEXTUREACCESS_STREAMING, fw, fh)
+      if state.texture == nil then
+        error("SDL_CreateTexture failed: " .. tostring(sdl.SDL_GetError()))
+      end
+      pcall(function()
+        sdl.SDL_SetTextureScaleMode(state.texture, SDL_ScaleModeNearest)
+      end)
+      state.frameW, state.frameH = fw, fh
     end
-    state.texture = sdl.SDL_CreateTexture(state.renderer, SDL_PIXELFORMAT_RGBA32,
-      SDL_TEXTUREACCESS_STREAMING, fw, fh)
-    if state.texture == nil then return false end
-    pcall(function()
-      sdl.SDL_SetTextureScaleMode(state.texture, SDL_ScaleModeNearest)
-    end)
-    state.frameW, state.frameH = fw, fh
-  end
 
-  state.bg = backgroundColor or state.bg
-  local ptr = imageData:getFFIPointer()
-  if state.sdl.SDL_UpdateTexture(state.texture, nil, ptr, fw * 4) ~= 0 then
-    warn("SDL_UpdateTexture failed: %s", tostring(state.sdl.SDL_GetError()))
+    state.bg = backgroundColor or state.bg
+    local ptr = imageData:getFFIPointer()
+    if state.sdl.SDL_UpdateTexture(state.texture, nil, ptr, fw * 4) ~= 0 then
+      error("SDL_UpdateTexture failed: " .. tostring(state.sdl.SDL_GetError()))
+    end
+
+    local r = math.floor(state.bg / 0x10000) % 0x100
+    local g = math.floor(state.bg / 0x100) % 0x100
+    local b = state.bg % 0x100
+    state.sdl.SDL_SetRenderDrawColor(state.renderer, r, g, b, 255)
+    state.sdl.SDL_RenderClear(state.renderer)
+
+    local vw, vh = windowSize()
+    local dx, dy, dw, dh = Bridge.letterbox(vw, vh, state.frameW, state.frameH)
+    local dest = state.ffi.new("SDL_Rect", { x = dx, y = dy, w = dw, h = dh })
+    state.sdl.SDL_RenderCopy(state.renderer, state.texture, nil, dest)
+    state.sdl.SDL_RenderPresent(state.renderer)
+  end)
+
+  if not okPresent then
+    warn("companion present error: %s", tostring(presentErr))
+    destroyWindow()
     return false
   end
 
-  local r = math.floor(state.bg / 0x10000) % 0x100
-  local g = math.floor(state.bg / 0x100) % 0x100
-  local b = state.bg % 0x100
-  state.sdl.SDL_SetRenderDrawColor(state.renderer, r, g, b, 255)
-  state.sdl.SDL_RenderClear(state.renderer)
-
-  local vw, vh = windowSize()
-  local dx, dy, dw, dh = Bridge.letterbox(vw, vh, state.frameW, state.frameH)
-  local dest = state.ffi.new("SDL_Rect", { x = dx, y = dy, w = dw, h = dh })
-  state.sdl.SDL_RenderCopy(state.renderer, state.texture, nil, dest)
-  state.sdl.SDL_RenderPresent(state.renderer)
-
-  drainWindowEvents()
+  pcall(drainWindowEvents)
   -- One more pass after events (macOS often applies the drag size at end).
-  if state.window ~= nil then enforceAspect() end
+  if state.window ~= nil then pcall(enforceAspect) end
   return state.window ~= nil
 end
 
