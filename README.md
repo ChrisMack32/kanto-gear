@@ -139,7 +139,9 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
   display (centered), matching Linux, so a 16:9 maximize does not leave red
   side bars. The companion never removes host `WINDOWEVENT`s from LÖVE's shared
   SDL queue (that broke the main window close button on Windows); it watches
-  companion events instead.
+  companion events instead. With both windows open, clicking the main window X
+  closes the companion then quits — SDL only emits `SDL_QUIT` for the last
+  window, so the bridge synthesizes quit after tearing down the companion.
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need

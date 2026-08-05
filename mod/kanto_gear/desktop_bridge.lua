@@ -193,6 +193,8 @@ local state = {
   sdlHandlingMax = false,
   sdlPendingAspect = false,
   eventWatch = nil,
+  hostWindowId = 0,
+  hostClosing = false,
   frameW = FRAME_W,
   frameH = FRAME_H,
   logicalW = 0,
@@ -1458,22 +1460,31 @@ local function uninstallSdlEventWatch()
 end
 
 -- Observe companion WINDOWEVENTs without removing anything from LÖVE's shared
--- SDL queue. PeepEvents(GETEVENT) of host CLOSE was swallowing the main
--- window title-bar X on Windows.
+-- SDL queue. Also watch for host CLOSE: with two SDL windows, clicking the
+-- main window X only emits WINDOWEVENT_CLOSE (SDL_QUIT waits until the last
+-- window closes), so LÖVE never quits unless we tear down the companion and
+-- request quit ourselves.
 local function installSdlEventWatch()
   local sdl, ffi = state.sdl, state.ffi
   if not (sdl and ffi and sdl.SDL_AddEventWatch) then return end
   uninstallSdlEventWatch()
   local function watch(_userdata, event)
-    if not event or state.windowId == 0 then return 0 end
+    if not event then return 0 end
     if event.type ~= SDL_WINDOWEVENT then return 0 end
-    if event.window.windowID ~= state.windowId then return 0 end
+    local wid = event.window.windowID
     local kind = event.window.event
-    if kind == 14 then
-      state.userClosed = true
-    elseif kind == 8 or kind == 5 or kind == 6 then
-      state.needsRedraw = true
-      state.sdlPendingAspect = true
+    if kind == 14 then -- CLOSE
+      if state.windowId ~= 0 and wid == state.windowId then
+        state.userClosed = true
+      elseif state.window ~= nil then
+        -- Host (or any non-companion) close while companion is open.
+        state.hostClosing = true
+      end
+    elseif state.windowId ~= 0 and wid == state.windowId then
+      if kind == 8 or kind == 5 or kind == 6 then
+        state.needsRedraw = true
+        state.sdlPendingAspect = true
+      end
     end
     return 0
   end
@@ -1495,6 +1506,7 @@ local function destroySdlWindow()
   if not sdl then
     state.window, state.renderer, state.texture, state.hwnd = nil, nil, nil, nil
     state.windowId = 0
+    state.hostWindowId = 0
     return
   end
   withHostGL(function()
@@ -1504,11 +1516,13 @@ local function destroySdlWindow()
   end)
   state.texture, state.renderer, state.window, state.hwnd = nil, nil, nil, nil
   state.windowId = 0
+  state.hostWindowId = 0
   state.pointerDown = false
   state.prevButtons = 0
   state.nativeAspect = false
   state.sdlHandlingMax = false
   state.sdlPendingAspect = false
+  state.hostClosing = false
   state.lastPresentW, state.lastPresentH = 0, 0
   state.needsRedraw = false
 end
@@ -1518,6 +1532,29 @@ local function destroyWindow()
     x11DestroyWindow()
   else
     destroySdlWindow()
+  end
+end
+
+-- Companion must go first: SDL_QUIT is only delivered for the last window.
+local function requestHostQuit()
+  log("host window close requested; closing companion and quitting")
+  state.hostClosing = false
+  destroyWindow()
+  local love = rawget(_G, "love")
+  pcall(function()
+    if love and love.event then
+      if love.event.quit then
+        love.event.quit()
+      elseif love.event.push then
+        love.event.push("quit")
+      end
+    end
+  end)
+  local sdl, ffi = state.sdl, state.ffi
+  if sdl and ffi and sdl.SDL_PushEvent then
+    local ev = ffi.new("SDL_Event")
+    ev.type = 0x100 -- SDL_QUIT
+    pcall(function() sdl.SDL_PushEvent(ev) end)
   end
 end
 
@@ -1907,7 +1944,16 @@ local function ensureSdlWindow()
     state.frameW, state.frameH = FRAME_W, FRAME_H
     state.logicalW, state.logicalH = -1, -1 -- force clearSdlLogicalSize once
     state.userClosed = false
+    state.hostClosing = false
     state.sdlPendingAspect = false
+    -- Remember the LÖVE/host window id so we can detect its CLOSE.
+    state.hostWindowId = 0
+    pcall(function()
+      local host = sdl.SDL_GL_GetCurrentWindow and sdl.SDL_GL_GetCurrentWindow()
+      if host ~= nil then
+        state.hostWindowId = tonumber(sdl.SDL_GetWindowID(host)) or 0
+      end
+    end)
     installSdlEventWatch()
     lockNativeAspect(window)
     enforceAspect()
@@ -1935,10 +1981,13 @@ local function drainWindowEvents()
   local sdl = state.sdl
   if not sdl then return end
 
-  -- Do not PeepEvents(GETEVENT) on the shared SDL queue. Removing host
-  -- WINDOWEVENT_CLOSE (even when PushEvent'd back) broke the main window's
-  -- title-bar close button on Windows. Companion close / resize is observed
-  -- via SDL_AddEventWatch; size / maximize are also polled each frame.
+  -- Do not PeepEvents(GETEVENT) on the shared SDL queue. Companion close /
+  -- resize and host close are observed via SDL_AddEventWatch; size / maximize
+  -- are also polled each frame.
+  if state.hostClosing then
+    requestHostQuit()
+    return
+  end
   if state.userClosed then
     if state.window ~= nil then
       log("companion window closed by user")
