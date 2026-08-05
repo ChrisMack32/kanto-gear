@@ -126,7 +126,9 @@ already detects the `DRAMATIC_SHAPE` mod for loading-state UI.
   without XWayland will not get a companion window; check the game log (and
   `/tmp/kanto-gear-bridge.log`) for `desktop bridge inactive`. Maximized /
   fullscreen on Linux is remapped to the largest 160∶144 window that fits the
-  screen (centered), so a 16:9 maximize does not leave colored side bars.
+  screen (centered), so a 16:9 maximize does not leave colored side bars. On
+  multi-monitor setups the max-fit window stays on the monitor the companion
+  was already on.
 - The AYN Thor is the confirmed Android reference device. Comparable Android
   dual-display hardware is intended to work but remains community-tested.
 - External-monitor rotation and unusual multi-display Android layouts need

@@ -145,6 +145,7 @@ local state = {
   xPixW = 0,
   xPixH = 0,
   xWmDelete = nil,
+  xinerama = nil,
   xWinW = 0,
   xWinH = 0,
   needsRedraw = false,
@@ -603,6 +604,9 @@ local function defineX11(ffi)
     int XFree(void *data);
     int XDisplayWidth(Display *display, int screen_number);
     int XDisplayHeight(Display *display, int screen_number);
+    int XTranslateCoordinates(Display *display, Window src_w, Window dest_w,
+      int src_x, int src_y, int *dest_x_return, int *dest_y_return,
+      Window *child_return);
     int XMoveResizeWindow(Display *display, Window w, int x, int y,
       unsigned int width, unsigned int height);
     int XSendEvent(Display *display, Window w, int propagate, long event_mask,
@@ -628,6 +632,42 @@ local function tryLoadX11(ffi)
   if f then
     for line in f:lines() do
       local path = line:match("%s(/[^%s]*libX11%.so[^%s]*)")
+      if path then mapped = path; break end
+    end
+    f:close()
+  end
+  if mapped then table.insert(names, 1, mapped) end
+  for _, name in ipairs(names) do
+    local ok, lib = pcall(ffi.load, name)
+    if ok and lib then return lib, name end
+  end
+  return nil, nil
+end
+
+local function tryLoadXinerama(ffi)
+  pcall(function()
+    ffi.cdef[[
+      typedef struct {
+        int screen_number;
+        short x_org;
+        short y_org;
+        short width;
+        short height;
+      } XineramaScreenInfo;
+      int XineramaIsActive(Display *dpy);
+      XineramaScreenInfo *XineramaQueryScreens(Display *dpy, int *number);
+    ]]
+  end)
+  local names = {
+    "Xinerama", "libXinerama.so.1", "libXinerama.so",
+    "/usr/lib/x86_64-linux-gnu/libXinerama.so.1",
+    "/usr/lib64/libXinerama.so.1",
+  }
+  local mapped
+  local f = io.open("/proc/self/maps", "r")
+  if f then
+    for line in f:lines() do
+      local path = line:match("%s(/[^%s]*libXinerama%.so[^%s]*)")
       if path then mapped = path; break end
     end
     f:close()
@@ -765,10 +805,93 @@ local function x11WindowSize()
   return state.xWinW, state.xWinH
 end
 
--- Maximized / fullscreen via EWMH: keep the WM size and letterbox.
+-- Client top-left in root coordinates (handles reparenting WMs).
+local function x11WindowRootPos()
+  local ffi, x11 = state.ffi, state.x11
+  local ww, wh = x11WindowSize()
+  if not (x11 and state.xDisplay and state.xWindow and x11.XTranslateCoordinates) then
+    return 0, 0, ww, wh
+  end
+  local root = x11.XDefaultRootWindow(state.xDisplay)
+  local dx = ffi.new("int[1]")
+  local dy = ffi.new("int[1]")
+  local child = ffi.new("Window[1]")
+  local ok = pcall(function()
+    x11.XTranslateCoordinates(
+      state.xDisplay, state.xWindow, root, 0, 0, dx, dy, child)
+  end)
+  if not ok then return 0, 0, ww, wh end
+  return tonumber(dx[0]) or 0, tonumber(dy[0]) or 0, ww, wh
+end
+
+local function x11ListMonitors()
+  local x11, ffi = state.x11, state.ffi
+  local monitors = {}
+  local xin = state.xinerama
+  if xin and state.xDisplay and xin.XineramaIsActive and xin.XineramaQueryScreens then
+    local active = false
+    pcall(function() active = xin.XineramaIsActive(state.xDisplay) ~= 0 end)
+    if active then
+      local n = ffi.new("int[1]")
+      local info
+      local ok = pcall(function()
+        info = xin.XineramaQueryScreens(state.xDisplay, n)
+      end)
+      local count = ok and tonumber(n[0]) or 0
+      if info ~= nil and count > 0 then
+        for i = 0, count - 1 do
+          monitors[#monitors + 1] = {
+            x = tonumber(info[i].x_org) or 0,
+            y = tonumber(info[i].y_org) or 0,
+            w = tonumber(info[i].width) or 0,
+            h = tonumber(info[i].height) or 0,
+          }
+        end
+        pcall(function() x11.XFree(info) end)
+      end
+    end
+  end
+  if #monitors == 0 and x11 and x11.XDisplayWidth and state.xDisplay then
+    local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or 0
+    local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or 0
+    if sw > 0 and sh > 0 then
+      monitors[1] = { x = 0, y = 0, w = sw, h = sh }
+    end
+  end
+  return monitors
+end
+
+-- Monitor that currently contains the companion window center.
+local function x11MonitorForWindow()
+  local monitors = x11ListMonitors()
+  if #monitors == 0 then
+    return { x = 0, y = 0, w = 1920, h = 1080 }
+  end
+  local wx, wy, ww, wh = x11WindowRootPos()
+  local cx = wx + math.floor(ww / 2)
+  local cy = wy + math.floor(wh / 2)
+  for _, m in ipairs(monitors) do
+    if m.w > 0 and m.h > 0
+        and cx >= m.x and cx < m.x + m.w
+        and cy >= m.y and cy < m.y + m.h then
+      return m
+    end
+  end
+  local best, bestDist = monitors[1], nil
+  for _, m in ipairs(monitors) do
+    local mx = m.x + m.w / 2
+    local my = m.y + m.h / 2
+    local dist = (cx - mx) * (cx - mx) + (cy - my) * (cy - my)
+    if bestDist == nil or dist < bestDist then
+      best, bestDist = m, dist
+    end
+  end
+  return best
+end
+
+-- Maximized / fullscreen via EWMH.
 -- Do not treat "merely large" windows as expanded — on a 16:9 monitor a
--- big manual drag must still snap to the largest fitting 160:144 size,
--- otherwise pillarbox bars appear and the aspect lock looks broken.
+-- big manual drag must still snap to the largest fitting 160:144 size.
 local function x11IsExpanded(cw, ch)
   local x11, ffi = state.x11, state.ffi
   if not x11 or state.xDisplay == nil or state.xWindow == nil then return false end
@@ -781,7 +904,7 @@ local function x11IsExpanded(cw, ch)
     local nitems = ffi.new("unsigned long[1]")
     local bytesAfter = ffi.new("unsigned long[1]")
     local prop = ffi.new("unsigned char *[1]")
-    local statusOk, status = pcall(function()
+    local statusOk = pcall(function()
       return x11.XGetWindowProperty(
         state.xDisplay, state.xWindow, state.xAtomNetWmState,
         0, 64, 0, 0, -- AnyPropertyType = 0
@@ -806,27 +929,23 @@ local function x11IsExpanded(cw, ch)
     end
   end
 
-  -- Strict fallback only when the window truly fills the display (both axes).
-  if x11.XDisplayWidth and x11.XDisplayHeight and cw and ch then
-    local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or 0
-    local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or 0
-    if sw > 0 and sh > 0 and cw >= sw - 8 and ch >= sh - 8 then
-      return true
-    end
+  -- Strict fallback: fills the monitor the window is on (not the whole
+  -- virtual desktop spanning every display).
+  local mon = x11MonitorForWindow()
+  if mon and cw and ch and mon.w > 0 and mon.h > 0
+      and cw >= mon.w - 8 and ch >= mon.h - 8 then
+    return true
   end
   return false
 end
 
+-- Usable client max on the monitor that currently hosts the companion.
 local function x11UsableMax()
-  local x11 = state.x11
-  if not (x11 and x11.XDisplayWidth and state.xDisplay) then
-    return nil, nil
-  end
-  local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or 0
-  local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or 0
-  if sw <= 0 or sh <= 0 then return nil, nil end
-  -- Leave room for decorations / panels so the WM can actually apply the size.
-  return math.max(FRAME_W, sw - 16), math.max(FRAME_H, sh - 64)
+  local mon = x11MonitorForWindow()
+  if not mon or mon.w <= 0 or mon.h <= 0 then return nil, nil, nil end
+  local maxW = math.max(FRAME_W, mon.w - 16)
+  local maxH = math.max(FRAME_H, mon.h - 64)
+  return maxW, maxH, mon
 end
 
 local function x11SnapSize(cw, ch, prevW, prevH, absolute)
@@ -883,15 +1002,16 @@ end
 
 -- Maximize / fullscreen on a 16:9 monitor would pillarbox the 160:144 frame
 -- (theme filler often reads as red side bars). Turn that into the largest
--- exact 160:144 window that fits, centered on the screen.
+-- exact 160:144 window that fits, centered on the *same* monitor.
 x11ApplyMaxAspectFit = function()
   if state.xWindow == nil or not state.x11 then return state.xWinW, state.xWinH end
   if state.xHandlingMax then return state.xWinW, state.xWinH end
   state.xHandlingMax = true
   state.aspectLock = true
+  -- Capture the host monitor BEFORE clearing maximize (geometry still valid).
+  local maxW, maxH, mon = x11UsableMax()
   pcall(x11ClearExpandedState)
 
-  local maxW, maxH = x11UsableMax()
   local nw, nh
   if maxW and maxH then
     nw, nh = Bridge.clampAspectToMax(maxW + 1, maxH + 1, maxW, maxH, FRAME_W, FRAME_H)
@@ -899,12 +1019,11 @@ x11ApplyMaxAspectFit = function()
     nw = FRAME_W * DEFAULT_SCALE
     nh = FRAME_H * DEFAULT_SCALE
   end
+  mon = mon or { x = 0, y = 0, w = nw, h = nh }
 
   local x11, ffi = state.x11, state.ffi
-  local sw = tonumber(x11.XDisplayWidth(state.xDisplay, state.xScreen)) or nw
-  local sh = tonumber(x11.XDisplayHeight(state.xDisplay, state.xScreen)) or nh
-  local x = math.max(0, math.floor((sw - nw) / 2))
-  local y = math.max(0, math.floor((sh - nh) / 2))
+  local x = mon.x + math.max(0, math.floor((mon.w - nw) / 2))
+  local y = mon.y + math.max(0, math.floor((mon.h - nh) / 2))
   pcall(function()
     if x11.XMoveResizeWindow then
       x11.XMoveResizeWindow(state.xDisplay, state.xWindow, x, y, nw, nh)
@@ -933,11 +1052,11 @@ x11ApplyMaxAspectFit = function()
   else
     state.lastLockedW, state.lastLockedH = nw, nh
   end
-  -- Re-center after the size has actually stuck.
+  -- Re-center on the original monitor after the size has actually stuck.
   aw, ah = state.xWinW, state.xWinH
   if aw == nw and ah == nh then
-    local cx = math.max(0, math.floor((sw - nw) / 2))
-    local cy = math.max(0, math.floor((sh - nh) / 2))
+    local cx = mon.x + math.max(0, math.floor((mon.w - nw) / 2))
+    local cy = mon.y + math.max(0, math.floor((mon.h - nh) / 2))
     pcall(function()
       if x11.XMoveResizeWindow then
         x11.XMoveResizeWindow(state.xDisplay, state.xWindow, cx, cy, nw, nh)
@@ -950,7 +1069,8 @@ x11ApplyMaxAspectFit = function()
   state.needsRedraw = true
   state.aspectLock = false
   state.xHandlingMax = false
-  log("maximize remapped to max 160:144 fit %dx%d", nw, nh)
+  log("maximize remapped to max 160:144 fit %dx%d on monitor@%d,%d",
+    nw, nh, mon.x, mon.y)
   return state.xWinW, state.xWinH
 end
 
@@ -1241,6 +1361,9 @@ local function initX11Backend(ffi)
         unsigned int width, unsigned int height);
       int XSendEvent(Display *display, Window w, int propagate, long event_mask,
         XEvent *event_send);
+      int XTranslateCoordinates(Display *display, Window src_w, Window dest_w,
+        int src_x, int src_y, int *dest_x_return, int *dest_y_return,
+        Window *child_return);
     ]]
   end)
   local display = x11.XOpenDisplay(nil)
@@ -1256,6 +1379,8 @@ local function initX11Backend(ffi)
   state.xVisual = x11.XDefaultVisual(display, screen)
   state.xDepth = x11.XDefaultDepth(display, screen)
   state.xGc = x11.XDefaultGC(display, screen)
+  local xin, xinName = tryLoadXinerama(ffi)
+  state.xinerama = xin
   state.xWmDelete = x11.XInternAtom(display, "WM_DELETE_WINDOW", 0)
   state.xAtomNetWmState = x11.XInternAtom(display, "_NET_WM_STATE", 1)
   state.xAtomMaxHorz = x11.XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_HORZ", 1)
@@ -1267,7 +1392,8 @@ local function initX11Backend(ffi)
   end
   state.backend = "x11"
   state.usable = true
-  log("desktop bridge ready via X11 (%s) depth=%s", tostring(name), tostring(state.xDepth))
+  log("desktop bridge ready via X11 (%s) depth=%s xinerama=%s monitors=%d",
+    tostring(name), tostring(state.xDepth), tostring(xinName), #x11ListMonitors())
   return true
 end
 
