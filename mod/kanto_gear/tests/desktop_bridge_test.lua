@@ -114,6 +114,33 @@ do
   eq(h, 720, "already-fitting height unchanged")
 end
 
+-- HiDPI: scale window-point letterbox into 2× renderer pixels
+do
+  local dx, dy, dw, dh = Bridge.letterbox(480, 432, 160, 144)
+  local ox, oy, ow, oh, sx, sy = Bridge.scaleToOutput(dx, dy, dw, dh, 480, 432, 960, 864)
+  nearly(sx, 2, "retina scale x")
+  nearly(sy, 2, "retina scale y")
+  eq(ox, 0, "retina dx")
+  eq(oy, 0, "retina dy")
+  eq(ow, 960, "retina dw fills output width")
+  eq(oh, 864, "retina dh fills output height")
+end
+do
+  local ox, oy, ow, oh, sx, sy = Bridge.scaleToOutput(80, 0, 480, 432, 640, 432, 1280, 864)
+  nearly(sx, 2, "retina wide scale x")
+  eq(ox, 160, "retina wide pillarbox dx")
+  eq(ow, 960, "retina wide content width")
+  eq(oh, 864, "retina wide content height")
+end
+-- 1× DPI is a no-op
+do
+  local ox, oy, ow, oh, sx, sy = Bridge.scaleToOutput(0, 0, 480, 432, 480, 432, 480, 432)
+  nearly(sx, 1, "1x scale x")
+  nearly(sy, 1, "1x scale y")
+  eq(ow, 480, "1x dw unchanged")
+  eq(oh, 432, "1x dh unchanged")
+end
+
 -- rgb24 helper
 do
   local r, g, b = Bridge.rgb24ToFloat(0x0F380F)
