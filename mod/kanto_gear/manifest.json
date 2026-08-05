@@ -1,0 +1,16 @@
+{
+  "id": "kanto_gear",
+  "name": "Kanto Gear",
+  "version": "1.3.0",
+  "api": 2,
+  "entry": "main.lua",
+  "category": "UI",
+  "profile": "content",
+  "game_version": "0.0.0-dev || >=0.1.58 <2.0.0",
+  "affects_link": false,
+  "dependencies": [],
+  "optional_dependencies": [],
+  "conflicts": [],
+  "permissions": ["engine_internals"],
+  "description": "Dual-screen map, party, battle, PC and contextual touch controls. Opens a companion window on desktop Gen1Recomp (Windows/macOS/Linux) and uses the secondary display on supported Android hosts."
+}
